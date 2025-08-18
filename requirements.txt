@@ -5,3 +5,5 @@ scikit-learn
 openai
 python-dotenv
 openpyxl
+xlsxwriter
+requests
