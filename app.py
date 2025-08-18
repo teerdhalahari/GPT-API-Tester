@@ -75,10 +75,10 @@ st.markdown("""
 def initialize_openai_client():
     """Initialize OpenAI client with API key from .env file"""
     try:
-        if not OPENAI_API_KEY:
-            return None, "No OPENAI_API_KEY found in .env file"
+        if not user_api_key:
+            return None, "No user_api_key found in .env file"
         
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=user_api_key)
         # Test the connection with a simple request
         client.models.list()
         return client, True
@@ -612,7 +612,7 @@ def main():
     client, error = initialize_openai_client()
     if not client:
         st.error(f"❌ OpenAI API connection failed: {error}")
-        st.info("💡 Please make sure you have a `.env` file in your project directory with: `OPENAI_API_KEY=your_api_key_here`")
+        st.info("💡 Please make sure you have a `.env` file in your project directory with: `user_api_key=your_api_key_here`")
         return
     else:
         st.success("✅ OpenAI API connected successfully!")
@@ -971,3 +971,4 @@ def login():
 if __name__ == "__main__":
 
     main()
+
