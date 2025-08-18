@@ -8,6 +8,7 @@ from io import BytesIO
 import os
 import streamlit as st
 from dotenv import load_dotenv
+import pandas as pd
 
 # Load environment variables (optional for local use)
 load_dotenv()
@@ -971,4 +972,5 @@ def login():
 if __name__ == "__main__":
 
     main()
+
 
