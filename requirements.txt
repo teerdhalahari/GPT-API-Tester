@@ -7,3 +7,5 @@ python-dotenv
 openpyxl
 xlsxwriter
 requests
+flask
+flask-cors
