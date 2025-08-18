@@ -1,5 +1,3 @@
-import streamlit as st
-import pandas as pd
 import json
 import time
 import requests
@@ -8,11 +6,26 @@ from datetime import datetime
 from openai import OpenAI
 from io import BytesIO
 import os
+import streamlit as st
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables (optional for local use)
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+st.title("My GPT App")
+
+# Let user enter their API key
+user_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+
+if user_api_key:
+    client = OpenAI(api_key=user_api_key)
+    st.success("API key accepted! You can now use the app.")
+
+    # 👉 Place your OpenAI logic/code here using `client`
+
+else:
+    st.warning("Please enter your OpenAI API key to continue.")
+
 
 # Page configuration
 st.set_page_config(
@@ -956,4 +969,5 @@ def login():
                         st.json(endpoint['sample_payload'], expanded=False)
 
 if __name__ == "__main__":
+
     main()
