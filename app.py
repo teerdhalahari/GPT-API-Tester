@@ -9,24 +9,10 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 import pandas as pd
+import traceback
 
 # Load environment variables (optional for local use)
 load_dotenv()
-
-st.title("My GPT App")
-
-# Let user enter their API key
-user_api_key = st.text_input("Enter your OpenAI API key:", type="password")
-
-if user_api_key:
-    client = OpenAI(api_key=user_api_key)
-    st.success("API key accepted! You can now use the app.")
-
-    # 👉 Place your OpenAI logic/code here using `client`
-
-else:
-    st.warning("Please enter your OpenAI API key to continue.")
-
 
 # Page configuration
 st.set_page_config(
@@ -73,13 +59,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def initialize_openai_client():
-    """Initialize OpenAI client with API key from .env file"""
+def initialize_openai_client(api_key):
+    """Initialize OpenAI client with provided API key"""
     try:
-        if not user_api_key:
-            return None, "No user_api_key found in .env file"
+        if not api_key or not api_key.strip():
+            return None, "No API key provided"
         
-        client = OpenAI(api_key=user_api_key)
+        client = OpenAI(api_key=api_key.strip())
         # Test the connection with a simple request
         client.models.list()
         return client, True
@@ -193,7 +179,7 @@ def generate_comprehensive_test_cases(client, api_endpoint, http_method, sample_
         if category_tests:
             all_test_cases.extend(category_tests)
     
-    status_text.text(f"✅ Generated {len(all_test_cases)} total test cases")
+    status_text.text(f"Generated {len(all_test_cases)} total test cases")
     return all_test_cases
 
 def generate_category_tests_plain_text(client, category, api_endpoint, http_method, sample_payload, custom_headers):
@@ -465,69 +451,170 @@ def create_endpoint_selector(endpoints, base_url):
     
     return options
 
+def make_request(method, url, payload=None, headers=None):
+    """Make HTTP request with comprehensive error handling"""
+    
+    class MockResponse:
+        def __init__(self, status_code, text="", error=None):
+            self.status_code = status_code
+            self.text = text
+            self.error = error
+            self.elapsed = type('', (), {'total_seconds': lambda: 0})()
+    
+    try:
+        # Validate inputs
+        if not url or not method:
+            return MockResponse(999, "Invalid URL or method")
+        
+        # Prepare request kwargs
+        request_kwargs = {
+            "url": url,
+            "headers": headers or {"Content-Type": "application/json"},
+            "timeout": 30,  # Increased timeout for deployment
+            "allow_redirects": True
+        }
+        
+        # Handle payload based on method
+        if method.upper() in ["POST", "PUT", "PATCH"] and payload is not None:
+            if isinstance(payload, dict):
+                request_kwargs["json"] = payload
+            else:
+                request_kwargs["data"] = str(payload)
+        elif method.upper() == "GET" and payload:
+            request_kwargs["params"] = payload if isinstance(payload, dict) else {"q": str(payload)}
+        
+        # Make the request
+        response = requests.request(method, **request_kwargs)
+        return response
+        
+    except requests.exceptions.Timeout:
+        return MockResponse(408, "Request timeout after 30 seconds")
+    except requests.exceptions.ConnectionError as e:
+        return MockResponse(503, f"Connection error: {str(e)}")
+    except requests.exceptions.RequestException as e:
+        return MockResponse(500, f"Request failed: {str(e)}")
+    except Exception as e:
+        return MockResponse(999, f"Unexpected error: {str(e)}")
+
 def execute_tests(test_cases, api_endpoint, base_headers):
-    """Execute all test cases and return results"""
+    """Execute all test cases and return results with comprehensive error handling"""
     
     results = []
     stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0}
     category_stats = {}
     
+    # Debug information
+    st.write(f"Debug: Starting test execution with {len(test_cases)} test cases")
+    st.write(f"Debug: API endpoint: {api_endpoint}")
+    st.write(f"Debug: Base headers: {base_headers}")
+    
+    # Test basic connectivity first
+    try:
+        test_response = requests.get("https://httpbin.org/get", timeout=10)
+        st.write(f"Debug: Basic connectivity test status: {test_response.status_code}")
+    except Exception as e:
+        st.error(f"Debug: Basic connectivity failed: {e}")
+        st.error("This suggests a network connectivity issue in the deployment environment")
+        return [], {"total": 0, "passed": 0, "failed": 0, "errors": 0}, {}
+    
+    if not test_cases:
+        st.error("No test cases to execute")
+        return results, stats, category_stats
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, test_case in enumerate(test_cases):
-        progress_bar.progress((i + 1) / len(test_cases))
-        status_text.text(f"Executing test {i+1}/{len(test_cases)}: {test_case['name']}")
-        
-        category = test_case.get("category", "unknown")
-        
-        if category not in category_stats:
-            category_stats[category] = {"total": 0, "passed": 0, "failed": 0}
-        category_stats[category]["total"] += 1
-        stats["total"] += 1
-        
         try:
+            progress_bar.progress((i + 1) / len(test_cases))
+            test_name = test_case.get('name', f'Test {i+1}')
+            status_text.text(f"Executing test {i+1}/{len(test_cases)}: {test_name}")
+            
+            category = test_case.get("category", "unknown")
+            
+            if category not in category_stats:
+                category_stats[category] = {"total": 0, "passed": 0, "failed": 0}
+            category_stats[category]["total"] += 1
+            stats["total"] += 1
+            
+            # Extract test parameters with defaults
             method = test_case.get("method", "GET")
             payload = test_case.get("payload")
-            headers = {**base_headers, **(test_case.get("headers", {}) or {})}
+            test_headers = test_case.get("headers", {})
             expected_status = test_case.get("expected_status_code", 200)
             risk_level = test_case.get("risk_level", "MEDIUM")
             
-            response = make_request(method, api_endpoint, payload, headers)
+            # Merge headers safely
+            merged_headers = {}
+            if base_headers:
+                merged_headers.update(base_headers)
+            if test_headers:
+                merged_headers.update(test_headers)
             
-            status_matches = response.status_code == expected_status
+            # Execute the request
+            response = make_request(method, api_endpoint, payload, merged_headers)
             
-            if status_matches:
-                stats["passed"] += 1
-                category_stats[category]["passed"] += 1
-            else:
-                stats["failed"] += 1
+            # Check if it's our mock response (error case)
+            if hasattr(response, 'error') or response.status_code == 999:
+                stats["errors"] += 1
                 category_stats[category]["failed"] += 1
-            
-            results.append({
-                "test_name": test_case["name"],
-                "category": category,
-                "description": test_case.get("description", ""),
-                "method": method,
-                "payload": str(payload) if payload else "",
-                "headers": str(test_case.get("headers", {})),
-                "expected_status": expected_status,
-                "actual_status": response.status_code,
-                "response_body": response.text[:200],
-                "response_time": response.elapsed.total_seconds(),
-                "status_matches": status_matches,
-                "risk_level": risk_level,
-                "coverage_area": test_case.get("coverage_area", ""),
-                "test_result": "PASS" if status_matches else "FAIL"
-            })
-            
+                
+                results.append({
+                    "test_name": test_name,
+                    "category": category,
+                    "description": test_case.get("description", ""),
+                    "method": method,
+                    "payload": str(payload) if payload else "",
+                    "headers": str(test_headers),
+                    "expected_status": expected_status,
+                    "actual_status": response.status_code,
+                    "response_body": response.text[:200],
+                    "response_time": 0,
+                    "status_matches": False,
+                    "risk_level": risk_level,
+                    "coverage_area": test_case.get("coverage_area", ""),
+                    "test_result": "ERROR",
+                    "error": response.text
+                })
+            else:
+                # Normal response handling
+                status_matches = response.status_code == expected_status
+                
+                if status_matches:
+                    stats["passed"] += 1
+                    category_stats[category]["passed"] += 1
+                else:
+                    stats["failed"] += 1
+                    category_stats[category]["failed"] += 1
+                
+                results.append({
+                    "test_name": test_name,
+                    "category": category,
+                    "description": test_case.get("description", ""),
+                    "method": method,
+                    "payload": str(payload) if payload else "",
+                    "headers": str(test_headers),
+                    "expected_status": expected_status,
+                    "actual_status": response.status_code,
+                    "response_body": response.text[:200] if hasattr(response, 'text') else "",
+                    "response_time": response.elapsed.total_seconds() if hasattr(response, 'elapsed') else 0,
+                    "status_matches": status_matches,
+                    "risk_level": risk_level,
+                    "coverage_area": test_case.get("coverage_area", ""),
+                    "test_result": "PASS" if status_matches else "FAIL"
+                })
+                
         except Exception as e:
             stats["errors"] += 1
-            category_stats[category]["failed"] += 1
+            if category in category_stats:
+                category_stats[category]["failed"] += 1
+            
+            st.error(f"Error executing test {i+1}: {str(e)}")
+            st.code(traceback.format_exc())
             
             results.append({
-                "test_name": test_case["name"],
-                "category": category,
+                "test_name": test_case.get("name", f"Test {i+1}"),
+                "category": test_case.get("category", "unknown"),
                 "description": test_case.get("description", ""),
                 "error": str(e),
                 "status_matches": False,
@@ -536,27 +623,8 @@ def execute_tests(test_cases, api_endpoint, base_headers):
                 "test_result": "ERROR"
             })
     
-    status_text.text("✅ Test execution completed!")
+    status_text.text("Test execution completed!")
     return results, stats, category_stats
-
-def make_request(method, url, payload=None, headers=None):
-    """Make HTTP request"""
-    
-    request_kwargs = {
-        "url": url,
-        "headers": headers or {"Content-Type": "application/json"},
-        "timeout": 10
-    }
-    
-    if method.upper() in ["POST", "PUT", "PATCH"] and payload is not None:
-        if isinstance(payload, dict):
-            request_kwargs["json"] = payload
-        else:
-            request_kwargs["data"] = str(payload)
-    elif method.upper() == "GET" and payload:
-        request_kwargs["params"] = payload if isinstance(payload, dict) else {"q": str(payload)}
-    
-    return requests.request(method, **request_kwargs)
 
 def create_excel_download(results, stats, category_stats):
     """Create Excel file with detailed results"""
@@ -607,19 +675,26 @@ def create_excel_download(results, stats, category_stats):
 
 # Main Streamlit App
 def main():
-    st.markdown('<div class="main-header">🔒 GPT API Security Tester</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">GPT API Security Tester</div>', unsafe_allow_html=True)
     
-    # Initialize OpenAI client
-    client, error = initialize_openai_client()
-    if not client:
-        st.error(f"❌ OpenAI API connection failed: {error}")
-        st.info("💡 Please make sure you have a `.env` file in your project directory with: `user_api_key=your_api_key_here`")
+    # Get API key from user
+    user_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+    
+    if not user_api_key:
+        st.warning("Please enter your OpenAI API key to continue.")
         return
-    else:
-        st.success("✅ OpenAI API connected successfully!")
+    
+    # Initialize client with the provided key
+    client, error = initialize_openai_client(user_api_key)
+    if not client:
+        st.error(f"OpenAI API connection failed: {error}")
+        st.info("Please make sure your API key is valid and has sufficient credits.")
+        return
+    
+    st.success("OpenAI API connected successfully!")
     
     # Main content area - Flask Code Input
-    st.header("📝 Flask API Code Analysis")
+    st.header("Flask API Code Analysis")
     
     # Code input section
     flask_code = st.text_area(
@@ -644,12 +719,12 @@ def login():
     with col1:
         base_url = st.text_input(
             "Base URL for your API:",
-            value="http://localhost:5000",
+            value="https://jsonplaceholder.typicode.com",
             help="Enter the base URL where your Flask API is running"
         )
     
     with col2:
-        analyze_button = st.button("🔍 Analyze Code", type="primary", use_container_width=True)
+        analyze_button = st.button("Analyze Code", type="primary", use_container_width=True)
     
     # Initialize session state for parsed endpoints
     if 'parsed_endpoints' not in st.session_state:
@@ -662,9 +737,9 @@ def login():
             st.session_state.parsed_endpoints = endpoints
             
             if endpoints:
-                st.success(f"✅ Found {len(endpoints)} endpoint(s)!")
+                st.success(f"Found {len(endpoints)} endpoint(s)!")
             else:
-                st.error("❌ No Flask routes found. Please check your code format.")
+                st.error("No Flask routes found. Please check your code format.")
     
     # Display parsed endpoints and configuration
     if st.session_state.parsed_endpoints:
@@ -674,7 +749,7 @@ def login():
         endpoint_options = create_endpoint_selector(endpoints, base_url)
         
         if endpoint_options:
-            st.header("🎯 Endpoint Selection & Configuration")
+            st.header("Endpoint Selection & Configuration")
             
             # Endpoint selector
             selected_option = st.selectbox(
@@ -691,20 +766,20 @@ def login():
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.subheader("📋 Endpoint Details")
+                    st.subheader("Endpoint Details")
                     st.write(f"**URL:** `{selected_endpoint['url']}`")
                     st.write(f"**Method:** `{selected_endpoint['method']}`")
                     st.write(f"**Expected Status Codes:** {selected_endpoint['expected_statuses']}")
                 
                 with col2:
-                    st.subheader("📄 Auto-detected Sample Payload")
+                    st.subheader("Auto-detected Sample Payload")
                     if selected_endpoint['payload']:
                         st.json(selected_endpoint['payload'])
                     else:
                         st.info("No payload detected (likely GET endpoint)")
                 
                 # Configuration section
-                st.subheader("⚙️ Test Configuration")
+                st.subheader("Test Configuration")
                 
                 col1, col2 = st.columns(2)
                 
@@ -728,13 +803,13 @@ def login():
                 try:
                     sample_payload = json.loads(manual_payload) if manual_payload.strip() else {}
                 except json.JSONDecodeError:
-                    st.error("❌ Invalid JSON in payload. Please check your format.")
+                    st.error("Invalid JSON in payload. Please check your format.")
                     return
                 
                 try:
                     custom_headers = json.loads(custom_headers_input) if custom_headers_input.strip() else {}
                 except json.JSONDecodeError:
-                    st.error("❌ Invalid JSON in headers. Please check your format.")
+                    st.error("Invalid JSON in headers. Please check your format.")
                     return
                 
                 # Store configuration in session state
@@ -752,12 +827,12 @@ def login():
                     st.session_state.test_results = None
                 
                 # Test case generation section
-                st.header("🧪 Test Case Generation")
+                st.header("Test Case Generation")
                 
                 col1, col2 = st.columns([1, 1])
                 
                 with col1:
-                    if st.button("🚀 Generate Test Cases", type="primary", use_container_width=True):
+                    if st.button("Generate Test Cases", type="primary", use_container_width=True):
                         config = st.session_state.test_config
                         with st.spinner("Generating comprehensive test cases..."):
                             st.session_state.test_cases = generate_comprehensive_test_cases(
@@ -774,16 +849,16 @@ def login():
                 
                 # Display generated test cases
                 if st.session_state.test_cases:
-                    st.success(f"✅ Successfully generated {len(st.session_state.test_cases)} test cases!")
+                    st.success(f"Successfully generated {len(st.session_state.test_cases)} test cases!")
                     categories = {}
                     for test in st.session_state.test_cases:
                         category = test.get('category', 'unknown')
                         categories[category] = categories.get(category, 0) + 1
                     category_info = " | ".join([f"{cat.replace('_', ' ').title()}: {count}" for cat, count in categories.items()])
-                    st.info(f"📊 **Category Breakdown:** {category_info}")
+                    st.info(f"**Category Breakdown:** {category_info}")
                     
                     # Test cases preview
-                    with st.expander("📋 Detailed Test Cases Report", expanded=False):
+                    with st.expander("Detailed Test Cases Report", expanded=False):
                         for i, test in enumerate(st.session_state.test_cases, 1):
                             st.markdown("---")  # Separator line
                             
@@ -800,17 +875,17 @@ def login():
                             
                             # Match status with visual indicator
                             if got == 'Not executed yet':
-                                st.markdown("**Match:** ⏳ Not tested")
+                                st.markdown("**Match:** Not tested")
                             elif expected == got:
-                                st.markdown("**Match:** ✅ True")
+                                st.markdown("**Match:** True")
                             else:
-                                st.markdown("**Match:** ❌ False")
+                                st.markdown("**Match:** False")
                             
                             # Description
                             st.markdown(f"**Description:** {test.get('description', 'No description available')}")
                             
                             # Additional details in expandable section
-                            with st.expander(f"🔍 Technical Details - Test {i}", expanded=False):
+                            with st.expander(f"Technical Details - Test {i}", expanded=False):
                                 col1, col2 = st.columns(2)
                                 with col1:
                                     st.markdown(f"**Method:** {test.get('method', 'GET')}")
@@ -825,12 +900,12 @@ def login():
                 
                 # Test execution section
                 if st.session_state.test_cases:
-                    st.header("⚡ Test Execution")
+                    st.header("Test Execution")
                     
                     col1, col2 = st.columns([1, 1])
                     
                     with col1:
-                        if st.button("🎯 Execute Tests", type="primary", use_container_width=True):
+                        if st.button("Execute Tests", type="primary", use_container_width=True):
                             config = st.session_state.test_config
                             base_headers = {"Content-Type": "application/json", **config['custom_headers']}
                             
@@ -852,7 +927,7 @@ def login():
                         category_stats = st.session_state.test_results['category_stats']
                         results = st.session_state.test_results['results']
                         
-                        st.header("📊 Test Results")
+                        st.header("Test Results")
                         
                         # Overall metrics
                         col1, col2, col3, col4 = st.columns(4)
@@ -867,7 +942,7 @@ def login():
                             st.metric("Errors", stats['errors'])
                         
                         # Category breakdown
-                        st.subheader("📂 Results by Category")
+                        st.subheader("Results by Category")
                         
                         category_data = []
                         for category, cat_stats in category_stats.items():
@@ -886,11 +961,11 @@ def login():
                         # Failed tests summary
                         failed_tests = [r for r in results if not r.get("status_matches", False)]
                         if failed_tests:
-                            st.subheader("❌ Failed Tests Summary")
+                            st.subheader("Failed Tests Summary")
                             
                             high_risk_failures = [r for r in failed_tests if r.get("risk_level", "").upper() in ["HIGH", "CRITICAL"]]
                             if high_risk_failures:
-                                st.error(f"🚨 {len(high_risk_failures)} high-risk failures detected!")
+                                st.error(f"ALERT: {len(high_risk_failures)} high-risk failures detected!")
                             
                             # Show failed tests table
                             failed_df = pd.DataFrame(failed_tests)
@@ -899,7 +974,7 @@ def login():
                             st.dataframe(failed_df[available_columns], use_container_width=True)
                         
                         # Download section
-                        st.subheader("💾 Download Results")
+                        st.subheader("Download Results")
                         
                         col1, col2 = st.columns(2)
                         
@@ -909,7 +984,7 @@ def login():
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                             
                             st.download_button(
-                                label="📊 Download Detailed Report (Excel)",
+                                label="Download Detailed Report (Excel)",
                                 data=excel_buffer,
                                 file_name=f"api_test_results_{timestamp}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -929,7 +1004,7 @@ def login():
                             }
                             
                             st.download_button(
-                                label="📄 Download Results (JSON)",
+                                label="Download Results (JSON)",
                                 data=json.dumps(json_data, indent=2),
                                 file_name=f"api_test_results_{timestamp}.json",
                                 mime="application/json",
@@ -939,7 +1014,7 @@ def login():
     else:
         # Show instructions if no code is provided
         st.info("""
-        👆 **How to use:**
+        **How to use:**
         
         1. **Paste your Flask API code** in the text area above
         2. **Set your base URL** (e.g., http://localhost:5000)  
@@ -949,18 +1024,18 @@ def login():
         6. **Download detailed results** in Excel format
         
         The app will automatically detect:
-        - 🎯 All Flask routes and HTTP methods
-        - 📝 Expected request payloads 
-        - 📊 Expected response status codes
-        - 🔒 Security test scenarios
+        - All Flask routes and HTTP methods
+        - Expected request payloads 
+        - Expected response status codes
+        - Security test scenarios
         """)
     
     # Sidebar with detected endpoints info
     if st.session_state.parsed_endpoints:
         with st.sidebar:
-            st.header("🔍 Detected Endpoints")
+            st.header("Detected Endpoints")
             for i, endpoint in enumerate(st.session_state.parsed_endpoints):
-                with st.expander(f"📍 {endpoint['route']}", expanded=False):
+                with st.expander(f"{endpoint['route']}", expanded=False):
                     st.write(f"**Methods:** {', '.join(endpoint['methods'])}")
                     st.write(f"**Function:** {endpoint['function_name']}")
                     if endpoint['expected_fields']:
@@ -970,7 +1045,4 @@ def login():
                         st.json(endpoint['sample_payload'], expanded=False)
 
 if __name__ == "__main__":
-
     main()
-
-
