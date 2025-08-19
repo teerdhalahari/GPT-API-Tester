@@ -1,3 +1,5 @@
+import streamlit as st
+import pandas as pd
 import json
 import time
 import requests
@@ -6,12 +8,12 @@ from datetime import datetime
 from openai import OpenAI
 from io import BytesIO
 import os
-import streamlit as st
 from dotenv import load_dotenv
-import pandas as pd
-import traceback
+import shlex
+from urllib.parse import urlparse, parse_qs
+import zipfile
 
-# Load environment variables (optional for local use)
+# Load environment variables
 load_dotenv()
 
 # Page configuration
@@ -56,6 +58,17 @@ st.markdown("""
         color: #0c5460;
         margin: 1rem 0;
     }
+    .code-input {
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+    }
+    .upload-section {
+        border: 2px dashed #ccc;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -72,177 +85,631 @@ def initialize_openai_client(api_key):
     except Exception as e:
         return None, str(e)
 
-def generate_comprehensive_test_cases(client, api_endpoint, http_method, sample_payload, custom_headers):
-    """Generate test cases using GPT with plain text format"""
+def read_uploaded_files(uploaded_files):
+    """Read content from uploaded files"""
+    all_content = ""
+    file_info = []
     
-    categories = [
-        {
-            "name": "Flow Level Edge Cases",
-            "description": "Test request flow, order of operations, state changes",
-            "coverage_areas": [
-                "Missing authentication steps", 
-                "Wrong sequence of operations", 
-                "Incomplete request flows",
-                "Session state transitions",
-                "Duplicate operations",
-                "Operation dependencies",
-                "Flow interruption scenarios"
-            ]
-        },
-        {
-            "name": "Limits and Boundaries", 
-            "description": "Test maximum/minimum values, length limits, numeric boundaries",
-            "coverage_areas": [
-                "Field length limits (min/max)",
-                "Numeric boundary values", 
-                "Empty and null inputs",
-                "Integer overflow/underflow",
-                "String length extremes",
-                "Array size limits",
-                "Memory constraints",
-                "Timeout boundaries"
-            ]
-        },
-        {
-            "name": "Special Characters and Unique Inputs",
-            "description": "Test unusual characters, Unicode, symbols",
-            "coverage_areas": [
-                "Unicode characters (various languages)",
-                "Special symbols (@#$%^&*)",
-                "Control characters",
-                "Emoji and extended Unicode",
-                "Encoding edge cases",
-                "Null bytes and terminators",
-                "Whitespace variations",
-                "Character escaping scenarios"
-            ]
-        },
-        {
-            "name": "Branches and Conditions",
-            "description": "Test different logical paths and conditions", 
-            "coverage_areas": [
-                "Different user roles/permissions",
-                "Conditional business logic",
-                "Feature flags and toggles",
-                "Status-dependent behavior",
-                "Multi-path decision trees",
-                "Error condition branches",
-                "Configuration-dependent paths",
-                "Environment-specific conditions"
-            ]
-        },
-        {
-            "name": "Escape Characters and Injection",
-            "description": "Test escape sequences and injection attempts",
-            "coverage_areas": [
-                "SQL injection (various techniques)",
-                "XSS (stored, reflected, DOM)",
-                "Command injection",
-                "LDAP injection",
-                "XML/XXE injection",
-                "Template injection",
-                "Path traversal attacks",
-                "Script injection variants",
-                "NoSQL injection",
-                "OS command injection"
-            ]
-        },
-        {
-            "name": "Security Edge Cases",
-            "description": "Test authentication bypass, authorization issues",
-            "coverage_areas": [
-                "Authentication bypass techniques",
-                "Authorization privilege escalation",
-                "Token manipulation (JWT, session)",
-                "CSRF attack scenarios",
-                "Session fixation/hijacking",
-                "Rate limiting bypass",
-                "Input validation bypass",
-                "Security header bypass",
-                "CORS misconfiguration",
-                "Insecure direct object references"
-            ]
-        }
+    for uploaded_file in uploaded_files:
+        try:
+            if uploaded_file.type == "text/plain" or uploaded_file.name.endswith(('.py', '.js', '.ts', '.java', '.php', '.rb', '.go', '.rs')):
+                content = str(uploaded_file.read(), "utf-8")
+                all_content += f"\n\n# === File: {uploaded_file.name} ===\n"
+                all_content += content
+                file_info.append({"name": uploaded_file.name, "size": len(content), "type": uploaded_file.type})
+            
+            elif uploaded_file.name.endswith('.zip'):
+                # Handle ZIP files
+                with zipfile.ZipFile(uploaded_file, 'r') as zip_file:
+                    for file_name in zip_file.namelist():
+                        if file_name.endswith(('.py', '.js', '.ts', '.java', '.php', '.rb', '.go', '.rs', '.txt')):
+                            try:
+                                with zip_file.open(file_name) as file:
+                                    content = file.read().decode('utf-8')
+                                    all_content += f"\n\n# === File: {file_name} (from {uploaded_file.name}) ===\n"
+                                    all_content += content
+                                    file_info.append({"name": file_name, "size": len(content), "type": "from_zip"})
+                            except Exception as e:
+                                st.warning(f"Could not read {file_name} from zip: {e}")
+            
+        except Exception as e:
+            st.error(f"Error reading {uploaded_file.name}: {e}")
+    
+    return all_content, file_info
+
+def parse_curl_command(curl_command):
+    """Parse curl command to extract URL, method, headers, and data"""
+    try:
+        # Remove curl from the beginning if present
+        curl_command = curl_command.strip()
+        if curl_command.startswith('curl'):
+            curl_command = curl_command[4:].strip()
+        
+        # Use shlex to properly parse the command
+        parts = shlex.split(curl_command)
+        
+        url = None
+        method = 'GET'
+        headers = {}
+        data = None
+        
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            
+            if part.startswith('http'):
+                url = part
+            elif part in ['-X', '--request']:
+                if i + 1 < len(parts):
+                    method = parts[i + 1].upper()
+                    i += 1
+            elif part in ['-H', '--header']:
+                if i + 1 < len(parts):
+                    header_str = parts[i + 1]
+                    if ':' in header_str:
+                        key, value = header_str.split(':', 1)
+                        headers[key.strip()] = value.strip()
+                    i += 1
+            elif part in ['-d', '--data', '--data-raw']:
+                if i + 1 < len(parts):
+                    data_str = parts[i + 1]
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        # If not JSON, treat as form data or plain text
+                        data = data_str
+                    i += 1
+            
+            i += 1
+        
+        if not url:
+            return None, "No URL found in curl command"
+        
+        return {
+            'url': url,
+            'method': method,
+            'headers': headers,
+            'data': data
+        }, None
+        
+    except Exception as e:
+        return None, f"Error parsing curl command: {str(e)}"
+
+def analyze_code_context(code, context_info=""):
+    """Analyze code and context to extract detailed API information for intelligent test generation"""
+    analysis = {
+        'endpoints': [],
+        'authentication_methods': [],
+        'validation_patterns': [],
+        'business_logic': [],
+        'security_controls': [],
+        'data_flows': [],
+        'error_handling': [],
+        'dependencies': [],
+        'database_operations': [],
+        'file_operations': [],
+        'external_apis': [],
+        'rate_limiting': [],
+        'input_sources': [],
+        'output_patterns': []
+    }
+    
+    # Combine code and context for comprehensive analysis
+    full_content = f"{code}\n\n# Context Information:\n{context_info}"
+    
+    # Authentication Analysis
+    auth_patterns = [
+        (r'@require_auth|@login_required|@authenticated', 'decorator_auth'),
+        (r'Authorization|Bearer|JWT|token', 'token_auth'),
+        (r'session\.|request\.session', 'session_auth'),
+        (r'BasicAuth|basic_auth', 'basic_auth'),
+        (r'OAuth|oauth', 'oauth'),
+        (r'API[_-]?KEY|api[_-]?key', 'api_key'),
+        (r'CSRF|csrf', 'csrf_protection'),
+        (r'verify_password|check_password|authenticate', 'password_auth')
     ]
     
-    all_test_cases = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    for pattern, auth_type in auth_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['authentication_methods'].append(auth_type)
     
-    for i, category in enumerate(categories):
-        status_text.text(f"Generating {category['name']}...")
-        progress_bar.progress((i + 1) / len(categories))
+    # Input Validation Patterns
+    validation_patterns = [
+        (r'validate|validator|Schema|schema', 'schema_validation'),
+        (r'required|optional|nullable', 'field_requirements'),
+        (r'min_length|max_length|length', 'length_validation'),
+        (r'email|Email|EMAIL_REGEX', 'email_validation'),
+        (r'int|integer|float|number', 'type_validation'),
+        (r'sanitize|escape|clean', 'input_sanitization'),
+        (r'regex|pattern|match', 'pattern_validation'),
+        (r'range|between|min|max', 'range_validation')
+    ]
+    
+    for pattern, validation_type in validation_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['validation_patterns'].append(validation_type)
+    
+    # Business Logic Detection
+    business_logic_patterns = [
+        (r'if.*role|permission|access', 'role_based_logic'),
+        (r'balance|payment|transaction|charge', 'financial_logic'),
+        (r'user_id|owner|belongs_to', 'ownership_logic'),
+        (r'status.*==|state.*==', 'state_dependent_logic'),
+        (r'limit|quota|throttle', 'limit_logic'),
+        (r'workflow|process|step', 'workflow_logic'),
+        (r'calculate|compute|process', 'calculation_logic'),
+        (r'notification|email|sms|alert', 'notification_logic')
+    ]
+    
+    for pattern, logic_type in business_logic_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['business_logic'].append(logic_type)
+    
+    # Security Controls
+    security_patterns = [
+        (r'hash|bcrypt|scrypt|pbkdf2', 'password_hashing'),
+        (r'encrypt|decrypt|cipher', 'encryption'),
+        (r'rate_limit|throttle|cooldown', 'rate_limiting'),
+        (r'CORS|cors|cross.origin', 'cors_controls'),
+        (r'Content-Security-Policy|CSP', 'csp_headers'),
+        (r'XSS|xss|cross.site', 'xss_protection'),
+        (r'SQL.*injection|parameterized|prepared', 'sql_injection_protection'),
+        (r'whitelist|blacklist|allow|deny', 'input_filtering')
+    ]
+    
+    for pattern, security_type in security_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['security_controls'].append(security_type)
+    
+    # Database Operations
+    db_patterns = [
+        (r'SELECT|INSERT|UPDATE|DELETE', 'sql_operations'),
+        (r'find|create|update|delete|save', 'orm_operations'),
+        (r'query|execute|fetch', 'database_queries'),
+        (r'transaction|commit|rollback', 'transaction_handling'),
+        (r'join|union|group_by|order_by', 'complex_queries')
+    ]
+    
+    for pattern, db_type in db_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['database_operations'].append(db_type)
+    
+    # File Operations
+    file_patterns = [
+        (r'upload|file|attachment', 'file_uploads'),
+        (r'download|serve_file|send_file', 'file_downloads'),
+        (r'open|read|write|path', 'file_system_access'),
+        (r'image|pdf|document', 'document_processing'),
+        (r'temp|tmp|cache', 'temporary_files')
+    ]
+    
+    for pattern, file_type in file_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['file_operations'].append(file_type)
+    
+    # Error Handling
+    error_patterns = [
+        (r'try:|except:|catch|finally', 'exception_handling'),
+        (r'raise|throw|error', 'error_generation'),
+        (r'log|logger|logging', 'error_logging'),
+        (r'400|401|403|404|422|429|500', 'http_error_codes'),
+        (r'ValidationError|AuthError|PermissionError', 'custom_errors')
+    ]
+    
+    for pattern, error_type in error_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['error_handling'].append(error_type)
+    
+    # Input Sources Detection
+    input_patterns = [
+        (r'request\.json|request\.data|request\.form', 'request_body'),
+        (r'request\.args|request\.params|query_params', 'query_parameters'),
+        (r'request\.headers|headers\[', 'http_headers'),
+        (r'path_params|route_params|url_params', 'path_parameters'),
+        (r'cookies|session|request\.cookies', 'cookies_session'),
+        (r'files|upload|multipart', 'file_uploads')
+    ]
+    
+    for pattern, input_type in input_patterns:
+        if re.search(pattern, full_content, re.IGNORECASE):
+            analysis['input_sources'].append(input_type)
+    
+    return analysis
+
+def parse_lambda_code(code):
+    """Parse Lambda function code to extract endpoints and their configurations"""
+    endpoints = []
+    
+    # Pattern for Lambda handler function
+    handler_pattern = r'def\s+(lambda_handler|handler)\s*\([^)]*\):(.*?)(?=\ndef|\Z)'
+    handler_matches = re.findall(handler_pattern, code, re.DOTALL)
+    
+    # Pattern for API Gateway event handling
+    api_patterns = [
+        # Standard API Gateway event structure
+        r'event\s*\.\s*get\s*\(\s*["\']httpMethod["\']\s*\)',
+        r'event\s*\[\s*["\']httpMethod["\']\s*\]',
+        # Direct method checks
+        r'httpMethod\s*==\s*["\']([^"\']+)["\']',
+        r'method\s*==\s*["\']([^"\']+)["\']',
+    ]
+    
+    for handler_name, handler_body in handler_matches:
+        # Extract HTTP methods
+        methods = set()
+        for pattern in api_patterns:
+            matches = re.findall(pattern, handler_body, re.IGNORECASE)
+            methods.update([m.upper() for m in matches if m])
         
-        category_tests = generate_category_tests_plain_text(
-            client, category, api_endpoint, http_method, sample_payload, custom_headers
-        )
-        if category_tests:
-            all_test_cases.extend(category_tests)
+        # If no specific methods found, look for common HTTP method checks
+        method_checks = re.findall(r'\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b', handler_body, re.IGNORECASE)
+        methods.update([m.upper() for m in method_checks])
+        
+        if not methods:
+            methods = ['POST']  # Default for Lambda APIs
+        
+        # Extract path parameters
+        path_params = re.findall(r'pathParameters["\']?\s*\.\s*get\s*\(\s*["\']([^"\']+)["\']', handler_body)
+        path_params.extend(re.findall(r'pathParameters\s*\[\s*["\']([^"\']+)["\']\s*\]', handler_body))
+        
+        # Extract query parameters
+        query_params = re.findall(r'queryStringParameters["\']?\s*\.\s*get\s*\(\s*["\']([^"\']+)["\']', handler_body)
+        query_params.extend(re.findall(r'queryStringParameters\s*\[\s*["\']([^"\']+)["\']\s*\]', handler_body))
+        
+        # Extract body parameters
+        body_params = []
+        # Look for json.loads patterns
+        json_patterns = [
+            r'json\.loads\s*\(\s*event\s*\[\s*["\']body["\']\s*\]\s*\)',
+            r'json\.loads\s*\(\s*body\s*\)',
+        ]
+        
+        for pattern in json_patterns:
+            if re.search(pattern, handler_body):
+                # Try to extract field names from subsequent code
+                field_patterns = [
+                    r'data\s*\.\s*get\s*\(\s*["\']([^"\']+)["\']',
+                    r'data\s*\[\s*["\']([^"\']+)["\']\s*\]',
+                    r'body_data\s*\.\s*get\s*\(\s*["\']([^"\']+)["\']',
+                ]
+                
+                for field_pattern in field_patterns:
+                    fields = re.findall(field_pattern, handler_body)
+                    body_params.extend(fields)
+        
+        # Create sample payload
+        sample_payload = {}
+        
+        # Add body parameters
+        for param in body_params:
+            if param in ['username', 'user', 'email']:
+                sample_payload[param] = 'testuser'
+            elif param in ['password', 'pass']:
+                sample_payload[param] = 'testpass123'
+            elif param in ['title', 'name']:
+                sample_payload[param] = 'Test Title'
+            elif param in ['body', 'content', 'description']:
+                sample_payload[param] = 'Test content'
+            elif param in ['id', 'user_id', 'item_id']:
+                sample_payload[param] = 1
+            else:
+                sample_payload[param] = 'test_value'
+        
+        # Extract expected status codes
+        status_codes = re.findall(r'["\']statusCode["\']\s*:\s*(\d+)', handler_body)
+        expected_statuses = [int(code) for code in status_codes] if status_codes else [200]
+        
+        # Determine route path (for Lambda, we'll use a generic path)
+        route_path = '/api/lambda-function'
+        
+        # If we can find specific path info, use it
+        path_matches = re.findall(r'["\']resource["\']\s*:\s*["\']([^"\']+)["\']', handler_body)
+        if path_matches:
+            route_path = path_matches[0]
+        
+        endpoints.append({
+            'route': route_path,
+            'methods': list(methods),
+            'function_name': handler_name,
+            'sample_payload': sample_payload,
+            'expected_fields': body_params,
+            'path_parameters': path_params,
+            'query_parameters': query_params,
+            'expected_statuses': expected_statuses,
+            'type': 'lambda',
+            'function_body': handler_body  # Include the actual code for analysis
+        })
     
-    status_text.text(f"Generated {len(all_test_cases)} total test cases")
-    return all_test_cases
+    return endpoints
 
-def generate_category_tests_plain_text(client, category, api_endpoint, http_method, sample_payload, custom_headers):
-    """Generate test cases for a specific category"""
+def parse_flask_code(code):
+    """Parse Flask API code to extract endpoints and their configurations"""
+    endpoints = []
     
-    system_prompt = f"""You are an expert API security tester. Generate comprehensive test cases for: {category['name']}
+    # Extract route decorators and function definitions
+    route_pattern = r'@app\.route\(["\']([^"\']+)["\'](?:,\s*methods\s*=\s*\[([^\]]+)\])?\)\s*\ndef\s+(\w+)\([^)]*\):'
+    matches = re.findall(route_pattern, code, re.MULTILINE)
+    
+    for route, methods, function_name in matches:
+        # Clean up methods
+        if methods:
+            methods_list = [m.strip().strip('"\'') for m in methods.split(',')]
+        else:
+            methods_list = ['GET']  # Default method
+        
+        # Try to extract sample payload from function body
+        function_pattern = rf'def\s+{function_name}\([^)]*\):(.*?)(?=\n@|\ndef\s|\nif\s+__name__|$)'
+        func_match = re.search(function_pattern, code, re.DOTALL)
+        
+        sample_payload = {}
+        expected_fields = []
+        function_body = ""
+        
+        if func_match:
+            function_body = func_match.group(1)
+            
+            # Look for data.get() calls to identify expected fields
+            field_pattern = r'data\.get\(["\']([^"\']+)["\']'
+            fields = re.findall(field_pattern, function_body)
+            expected_fields = fields
+            
+            # Create sample payload based on common field names
+            for field in fields:
+                if field in ['username', 'user', 'email']:
+                    sample_payload[field] = 'testuser'
+                elif field in ['password', 'pass']:
+                    sample_payload[field] = 'testpass123'
+                elif field in ['title', 'name']:
+                    sample_payload[field] = 'Test Title'
+                elif field in ['body', 'content', 'description']:
+                    sample_payload[field] = 'Test content'
+                elif field in ['id', 'user_id']:
+                    sample_payload[field] = 1
+                else:
+                    sample_payload[field] = 'test_value'
+        
+        # Determine expected status codes from return statements
+        expected_statuses = []
+        if func_match:
+            func_body = func_match.group(1)
+            status_pattern = r'return[^,]+,\s*(\d+)'
+            statuses = re.findall(status_pattern, func_body)
+            expected_statuses = [int(s) for s in statuses]
+        
+        if not expected_statuses:
+            expected_statuses = [200]  # Default
+        
+        endpoints.append({
+            'route': route,
+            'methods': methods_list,
+            'function_name': function_name,
+            'sample_payload': sample_payload,
+            'expected_fields': expected_fields,
+            'expected_statuses': expected_statuses,
+            'type': 'flask',
+            'function_body': function_body  # Include the actual code for analysis
+        })
+    
+    return endpoints
 
-Focus on: {category['description']}
-Coverage Areas Required: {len(category['coverage_areas'])} areas to cover
+def parse_general_api_code(code):
+    """Parse general API code (Express.js, FastAPI, etc.) to extract endpoints"""
+    endpoints = []
+    
+    # Patterns for different frameworks
+    patterns = {
+        'express': [
+            r'app\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']',
+            r'router\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']'
+        ],
+        'fastapi': [
+            r'@app\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']',
+            r'@router\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']'
+        ],
+        'django': [
+            r'path\s*\(\s*["\']([^"\']+)["\'].*?(\w+)\.as_view',
+            r'url\s*\(\s*["\']([^"\']+)["\']'
+        ]
+    }
+    
+    detected_framework = None
+    
+    # Detect framework
+    if 'express' in code.lower() or 'app.get' in code or 'app.post' in code:
+        detected_framework = 'express'
+    elif 'fastapi' in code.lower() or '@app.get' in code or '@app.post' in code:
+        detected_framework = 'fastapi'
+    elif 'django' in code.lower() or 'path(' in code:
+        detected_framework = 'django'
+    
+    if detected_framework:
+        for pattern in patterns[detected_framework]:
+            matches = re.findall(pattern, code, re.MULTILINE | re.IGNORECASE)
+            
+            for match in matches:
+                if len(match) == 2:
+                    if detected_framework in ['express', 'fastapi']:
+                        method, route = match
+                        methods_list = [method.upper()]
+                    else:  # django
+                        route, view_name = match
+                        methods_list = ['GET', 'POST']  # Default for Django
+                        
+                    # Extract parameters from route
+                    path_params = re.findall(r'[:\{](\w+)[\}]?', route)
+                    
+                    # Create basic sample payload
+                    sample_payload = {'test_field': 'test_value'}
+                    
+                    # Try to find function body for more context
+                    if detected_framework == 'express':
+                        func_pattern = rf'{method}\s*\(\s*["\'][^"\']*["\']\s*,\s*.*?\((.*?)\)\s*=>\s*\{{(.*?)\}}'
+                        func_match = re.search(func_pattern, code, re.DOTALL)
+                        function_body = func_match.group(2) if func_match else ""
+                    else:
+                        function_body = ""
+                    
+                    endpoints.append({
+                        'route': route,
+                        'methods': methods_list,
+                        'function_name': f'{detected_framework}_endpoint',
+                        'sample_payload': sample_payload,
+                        'expected_fields': ['test_field'],
+                        'expected_statuses': [200],
+                        'type': detected_framework,
+                        'path_parameters': path_params,
+                        'function_body': function_body
+                    })
+    
+    return endpoints
 
-COMPREHENSIVE COVERAGE REQUIREMENTS:
-You must ensure thorough testing of ALL these areas:
-{chr(10).join(f"• {area}" for area in category['coverage_areas'])}
+def parse_api_code(code):
+    """Unified API code parser that handles multiple frameworks"""
+    endpoints = []
+    
+    # Try Flask parsing first
+    flask_endpoints = parse_flask_code(code)
+    if flask_endpoints:
+        endpoints.extend(flask_endpoints)
+    
+    # Try Lambda parsing
+    lambda_endpoints = parse_lambda_code(code)
+    if lambda_endpoints:
+        endpoints.extend(lambda_endpoints)
+    
+    # Try general framework parsing if nothing found
+    if not endpoints:
+        general_endpoints = parse_general_api_code(code)
+        endpoints.extend(general_endpoints)
+    
+    return endpoints
 
-INTELLIGENT TEST GENERATION:
-1. DETERMINE OPTIMAL COUNT: Generate however many tests are needed to comprehensively cover ALL coverage areas
-2. QUALITY OVER QUANTITY: Each test should be meaningful and target real scenarios
-3. NO ARBITRARY LIMITS: Generate enough tests to ensure complete coverage
-4. AVOID REDUNDANCY: Don't create similar tests unless they test genuinely different scenarios
+def enhance_endpoints_with_context(endpoints, context_info):
+    """Enhance detected endpoints with context information (cURL, URLs, etc.)"""
+    enhanced_endpoints = endpoints.copy()
+    
+    if not context_info.strip():
+        return enhanced_endpoints
+    
+    # Try to parse context as cURL command
+    curl_info, error = parse_curl_command(context_info)
+    if curl_info:
+        # Match cURL info with detected endpoints or create new one
+        curl_endpoint = {
+            'route': urlparse(curl_info['url']).path or '/api/endpoint',
+            'methods': [curl_info['method']],
+            'function_name': 'curl_derived_endpoint',
+            'sample_payload': curl_info['data'] if curl_info['data'] else {},
+            'expected_fields': list(curl_info['data'].keys()) if isinstance(curl_info['data'], dict) else [],
+            'expected_statuses': [200],
+            'type': 'curl_derived',
+            'full_url': curl_info['url'],
+            'headers': curl_info['headers'],
+            'function_body': ''
+        }
+        
+        # Check if this matches any existing endpoint
+        matched = False
+        for i, endpoint in enumerate(enhanced_endpoints):
+            if (endpoint['route'] == curl_endpoint['route'] or 
+                curl_info['method'] in endpoint['methods']):
+                # Enhance existing endpoint with cURL data
+                enhanced_endpoints[i]['full_url'] = curl_info['url']
+                enhanced_endpoints[i]['headers'] = {**endpoint.get('headers', {}), **curl_info['headers']}
+                if curl_info['data'] and isinstance(curl_info['data'], dict):
+                    enhanced_endpoints[i]['sample_payload'].update(curl_info['data'])
+                matched = True
+                break
+        
+        if not matched:
+            enhanced_endpoints.append(curl_endpoint)
+    
+    # Look for URLs in context
+    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+[^\s<>"{}|\\^`\[\].,;]'
+    urls = re.findall(url_pattern, context_info)
+    
+    for url in urls:
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        # Update base URLs for existing endpoints
+        for endpoint in enhanced_endpoints:
+            if not endpoint.get('full_url'):
+                endpoint['full_url'] = base_url + endpoint['route']
+    
+    return enhanced_endpoints
 
+def generate_context_aware_test_cases(client, api_endpoint, http_method, sample_payload, custom_headers, code_analysis, endpoint_details):
+    """Generate test cases based on actual code analysis and context"""
+    
+    system_prompt = """You are an expert API security tester with deep knowledge of application security vulnerabilities and attack patterns. Your task is to generate highly targeted, context-aware security test cases based on ACTUAL CODE ANALYSIS and real-world attack scenarios.
 
-OUTPUT FORMAT (use this EXACT format):
-TEST_NAME: [descriptive name]
-METHOD: {http_method}
-PAYLOAD: [test payload]
-HEADERS: [any special headers needed]
+CRITICAL INSTRUCTIONS:
+1. ANALYZE THE PROVIDED CODE CONTEXT THOROUGHLY
+2. Generate test cases that are SPECIFIC to the actual code implementation
+3. Focus on REAL vulnerabilities that exist in the provided code
+4. Cover ALL security dimensions: Flow, Boundary, Edge Cases, Injection, Authentication, Authorization, Business Logic
+
+COMPREHENSIVE TEST COVERAGE REQUIRED:
+- **Flow Level**: Test request sequences, state transitions, operation dependencies
+- **Boundary Testing**: Field limits, numeric boundaries, array sizes, length constraints  
+- **Edge Cases**: Empty inputs, null values, special characters, Unicode, malformed data
+- **Security**: All injection types, auth bypass, privilege escalation, CSRF, XSS
+- **Business Logic**: Role checks, permission validation, state-dependent operations
+- **Error Handling**: Exception scenarios, error message leakage, stack traces
+
+OUTPUT FORMAT (use this EXACT format for each test):
+TEST_NAME: [descriptive name based on actual code analysis]
+METHOD: [HTTP method]
+PAYLOAD: [specific test payload]
+HEADERS: [any special headers]
 EXPECTED_STATUS: [expected HTTP status code]
-DESCRIPTION: [what this test validates and why it's important]
+DESCRIPTION: [what vulnerability/scenario this tests and WHY based on code analysis]
 RISK_LEVEL: [LOW/MEDIUM/HIGH/CRITICAL]
-COVERAGE_AREA: [which coverage area this addresses]
+ATTACK_VECTOR: [specific attack technique being tested]
+CODE_TARGET: [specific part of code this targets]
 ---
 
-QUALITY GUIDELINES:
-- Each test should target real vulnerabilities or edge cases
-- Vary payloads realistically based on: {sample_payload}
-- Use appropriate HTTP status codes (200/201 success, 400 bad request, 401 unauthorized, 403 forbidden, 422 validation error, 429 rate limit, 500 server error)
-- Ensure every coverage area is addressed by at least one test
-- Create additional tests for high-risk areas that warrant multiple test scenarios
+QUALITY REQUIREMENTS:
+- Each test must be JUSTIFIED by the actual code implementation
+- Generate comprehensive coverage (typically 40-100+ tests for thorough analysis)
+- Target REAL attack vectors that could exploit the specific code
+- Include both positive and negative test cases
+- Vary payloads based on actual field validation and business logic
+- Test ALL input sources identified in the code (body, query, path, headers)
 """
 
-    user_prompt = f"""Generate comprehensive test cases for {category['name']} targeting {api_endpoint}
+    user_prompt = f"""ENDPOINT TO TEST:
+URL: {api_endpoint}
+METHOD: {http_method}
+Sample Payload: {json.dumps(sample_payload, indent=2)}
+Headers: {json.dumps(custom_headers, indent=2)}
 
-BASE CONFIGURATION:
-- Endpoint: {api_endpoint} 
-- Method: {http_method}
-- Sample payload: {sample_payload}
-- Headers: {custom_headers}
+DETAILED CODE ANALYSIS:
+{json.dumps(code_analysis, indent=2)}
 
-COMPREHENSIVE COVERAGE MISSION:
-Create enough test cases to thoroughly validate ALL {len(category['coverage_areas'])} coverage areas:
-{chr(10).join(f"{i+1}. {area}" for i, area in enumerate(category['coverage_areas']))}
+SPECIFIC ENDPOINT DETAILS:
+Route: {endpoint_details.get('route', 'N/A')}
+Function: {endpoint_details.get('function_name', 'N/A')}
+Framework: {endpoint_details.get('type', 'N/A')}
+Expected Fields: {endpoint_details.get('expected_fields', [])}
+Path Parameters: {endpoint_details.get('path_parameters', [])}
+Query Parameters: {endpoint_details.get('query_parameters', [])}
 
-INSTRUCTIONS:
-- Analyze each coverage area and determine what tests are needed
-- Generate as many tests as required for complete coverage 
-- Ensure no coverage area is left untested
-- Create multiple tests for complex areas that need various attack vectors
-- Focus on realistic scenarios that actual security testers would use
-- Each test should provide unique value and not duplicate existing coverage
+ACTUAL FUNCTION CODE:
+{endpoint_details.get('function_body', 'No function body available')}
 
-Your goal is COMPLETE COVERAGE, not hitting a specific number. Generate however many tests are needed to comprehensively test this category.
+MISSION: Generate comprehensive, code-specific security test cases that:
+1. Target the ACTUAL vulnerabilities present in this specific implementation
+2. Test all identified input sources and validation patterns
+3. Exploit weaknesses in the detected authentication and authorization mechanisms  
+4. Challenge the business logic flows identified in the code
+5. Test boundary conditions based on actual field constraints
+6. Attempt all relevant injection attacks based on detected database/file operations
+7. Test error handling and information disclosure scenarios
+8. Validate security controls and bypass attempts
 
-"""
+Generate as many test cases as needed for COMPLETE security coverage of this specific endpoint (typically 50-150+ tests for thorough analysis). Each test should be directly justified by the code analysis provided."""
 
     try:
         response = client.chat.completions.create(
@@ -251,20 +718,20 @@ Your goal is COMPLETE COVERAGE, not hitting a specific number. Generate however 
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.2,  
-            max_tokens=6000 
+            temperature=0.1,  
+            max_tokens=8000
         )
         
         raw_response = response.choices[0].message.content.strip()
-        test_cases = parse_plain_text_tests(raw_response, category['name'], sample_payload, custom_headers)
+        test_cases = parse_context_aware_tests(raw_response, sample_payload, custom_headers)
         return test_cases
         
     except Exception as e:
-        st.error(f"Failed to generate tests for {category['name']}: {e}")
+        st.error(f"Failed to generate context-aware tests: {e}")
         return []
 
-def parse_plain_text_tests(raw_text, category, sample_payload, custom_headers):
-    """Parse plain text test cases"""
+def parse_context_aware_tests(raw_text, sample_payload, custom_headers):
+    """Parse context-aware test cases from GPT response"""
     
     if not raw_text or raw_text.strip() == "":
         return []
@@ -276,7 +743,7 @@ def parse_plain_text_tests(raw_text, category, sample_payload, custom_headers):
         if not block.strip():
             continue
             
-        test_case = {"category": category.lower().replace(' ', '_')}
+        test_case = {}
         
         patterns = {
             'name': r'TEST_NAME:\s*(.+?)(?:\n|$)',
@@ -284,9 +751,10 @@ def parse_plain_text_tests(raw_text, category, sample_payload, custom_headers):
             'payload': r'PAYLOAD:\s*(.+?)(?=\nHEADERS:|\nEXPECTED_STATUS:|\nDESCRIPTION:|$)',
             'headers': r'HEADERS:\s*(.+?)(?=\nEXPECTED_STATUS:|\nDESCRIPTION:|$)',
             'expected_status': r'EXPECTED_STATUS:\s*(.+?)(?:\n|$)',
-            'description': r'DESCRIPTION:\s*(.+?)(?=\nRISK_LEVEL:|\nCOVERAGE_AREA:|$)',
+            'description': r'DESCRIPTION:\s*(.+?)(?=\nRISK_LEVEL:|\nATTACK_VECTOR:|$)',
             'risk_level': r'RISK_LEVEL:\s*(.+?)(?:\n|$)',
-            'coverage_area': r'COVERAGE_AREA:\s*(.+?)(?:\n|$)'  
+            'attack_vector': r'ATTACK_VECTOR:\s*(.+?)(?:\n|$)',
+            'code_target': r'CODE_TARGET:\s*(.+?)(?:\n|$)'
         }
         
         for field, pattern in patterns.items():
@@ -316,7 +784,11 @@ def parse_plain_text_tests(raw_text, category, sample_payload, custom_headers):
             if 'risk_level' not in test_case:
                 test_case['risk_level'] = 'MEDIUM'
             if 'description' not in test_case:
-                test_case['description'] = 'Test case validation'
+                test_case['description'] = 'Context-aware security test'
+            if 'attack_vector' not in test_case:
+                test_case['attack_vector'] = 'General security testing'
+            if 'code_target' not in test_case:
+                test_case['code_target'] = 'General endpoint testing'
                 
             test_cases.append(test_case)
     
@@ -362,271 +834,146 @@ def parse_headers_value(headers_str, default_headers):
     
     return headers if headers else default_headers
 
-def parse_flask_code(code):
-    """Parse Flask API code to extract endpoints and their configurations"""
-    
-    endpoints = []
-    
-    # Extract route decorators and function definitions
-    route_pattern = r'@app\.route\(["\']([^"\']+)["\'](?:,\s*methods\s*=\s*\[([^\]]+)\])?\)\s*\ndef\s+(\w+)\([^)]*\):'
-    matches = re.findall(route_pattern, code, re.MULTILINE)
-    
-    for route, methods, function_name in matches:
-        # Clean up methods
-        if methods:
-            methods_list = [m.strip().strip('"\'') for m in methods.split(',')]
-        else:
-            methods_list = ['GET']  # Default method
-        
-        # Try to extract sample payload from function body
-        function_pattern = rf'def\s+{function_name}\([^)]*\):(.*?)(?=\n@|\ndef\s|\nif\s+__name__|$)'
-        func_match = re.search(function_pattern, code, re.DOTALL)
-        
-        sample_payload = {}
-        expected_fields = []
-        
-        if func_match:
-            func_body = func_match.group(1)
-            
-            # Look for data.get() calls to identify expected fields
-            field_pattern = r'data\.get\(["\']([^"\']+)["\']'
-            fields = re.findall(field_pattern, func_body)
-            expected_fields = fields
-            
-            # Create sample payload based on common field names
-            for field in fields:
-                if field in ['username', 'user', 'email']:
-                    sample_payload[field] = 'testuser'
-                elif field in ['password', 'pass']:
-                    sample_payload[field] = 'testpass123'
-                elif field in ['title', 'name']:
-                    sample_payload[field] = 'Test Title'
-                elif field in ['body', 'content', 'description']:
-                    sample_payload[field] = 'Test content'
-                elif field in ['id', 'user_id']:
-                    sample_payload[field] = 1
-                else:
-                    sample_payload[field] = 'test_value'
-        
-        # Determine expected status codes from return statements
-        expected_statuses = []
-        if func_match:
-            func_body = func_match.group(1)
-            status_pattern = r'return[^,]+,\s*(\d+)'
-            statuses = re.findall(status_pattern, func_body)
-            expected_statuses = [int(s) for s in statuses]
-        
-        if not expected_statuses:
-            expected_statuses = [200]  # Default
-        
-        endpoints.append({
-            'route': route,
-            'methods': methods_list,
-            'function_name': function_name,
-            'sample_payload': sample_payload,
-            'expected_fields': expected_fields,
-            'expected_statuses': expected_statuses
-        })
-    
-    return endpoints
-
 def create_endpoint_selector(endpoints, base_url):
     """Create a selector for available endpoints"""
     
     if not endpoints:
-        return None, None, None, None
+        return None
     
     # Create options for selectbox
     options = []
     for endpoint in endpoints:
         for method in endpoint['methods']:
-            full_url = f"{base_url.rstrip('/')}{endpoint['route']}"
+            # Use full_url if available, otherwise construct from base_url
+            if endpoint.get('full_url'):
+                full_url = endpoint['full_url']
+            elif base_url:
+                full_url = f"{base_url.rstrip('/')}{endpoint['route']}"
+            else:
+                full_url = endpoint['route']
+            
+            display_name = f"{method} {endpoint['route']}"
+            if endpoint.get('type'):
+                display_name += f" ({endpoint['type'].title()})"
+            
             options.append({
-                'display': f"{method} {endpoint['route']} ({endpoint['function_name']})",
+                'display': display_name,
                 'url': full_url,
                 'method': method,
                 'payload': endpoint['sample_payload'],
-                'expected_statuses': endpoint['expected_statuses']
+                'expected_statuses': endpoint['expected_statuses'],
+                'type': endpoint.get('type', 'unknown'),
+                'headers': endpoint.get('headers', {}),
+                'endpoint_details': endpoint
             })
     
     return options
 
-def make_request(method, url, payload=None, headers=None):
-    """Make HTTP request with comprehensive error handling"""
-    
-    class MockResponse:
-        def __init__(self, status_code, text="", error=None):
-            self.status_code = status_code
-            self.text = text
-            self.error = error
-            self.elapsed = type('', (), {'total_seconds': lambda: 0})()
-    
-    try:
-        # Validate inputs
-        if not url or not method:
-            return MockResponse(999, "Invalid URL or method")
-        
-        # Prepare request kwargs
-        request_kwargs = {
-            "url": url,
-            "headers": headers or {"Content-Type": "application/json"},
-            "timeout": 30,  # Increased timeout for deployment
-            "allow_redirects": True
-        }
-        
-        # Handle payload based on method
-        if method.upper() in ["POST", "PUT", "PATCH"] and payload is not None:
-            if isinstance(payload, dict):
-                request_kwargs["json"] = payload
-            else:
-                request_kwargs["data"] = str(payload)
-        elif method.upper() == "GET" and payload:
-            request_kwargs["params"] = payload if isinstance(payload, dict) else {"q": str(payload)}
-        
-        # Make the request
-        response = requests.request(method, **request_kwargs)
-        return response
-        
-    except requests.exceptions.Timeout:
-        return MockResponse(408, "Request timeout after 30 seconds")
-    except requests.exceptions.ConnectionError as e:
-        return MockResponse(503, f"Connection error: {str(e)}")
-    except requests.exceptions.RequestException as e:
-        return MockResponse(500, f"Request failed: {str(e)}")
-    except Exception as e:
-        return MockResponse(999, f"Unexpected error: {str(e)}")
-
 def execute_tests(test_cases, api_endpoint, base_headers):
-    """Execute all test cases and return results with comprehensive error handling"""
+    """Execute all test cases and return results"""
     
     results = []
     stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0}
-    category_stats = {}
-    
-    # Debug information
-    st.write(f"Debug: Starting test execution with {len(test_cases)} test cases")
-    st.write(f"Debug: API endpoint: {api_endpoint}")
-    st.write(f"Debug: Base headers: {base_headers}")
-    
-    # Test basic connectivity first
-    try:
-        test_response = requests.get("https://httpbin.org/get", timeout=10)
-        st.write(f"Debug: Basic connectivity test status: {test_response.status_code}")
-    except Exception as e:
-        st.error(f"Debug: Basic connectivity failed: {e}")
-        st.error("This suggests a network connectivity issue in the deployment environment")
-        return [], {"total": 0, "passed": 0, "failed": 0, "errors": 0}, {}
-    
-    if not test_cases:
-        st.error("No test cases to execute")
-        return results, stats, category_stats
+    attack_vector_stats = {}
+    risk_level_stats = {}
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, test_case in enumerate(test_cases):
+        progress_bar.progress((i + 1) / len(test_cases))
+        status_text.text(f"Executing test {i+1}/{len(test_cases)}: {test_case['name']}")
+        
+        attack_vector = test_case.get("attack_vector", "unknown")
+        risk_level = test_case.get("risk_level", "MEDIUM")
+        
+        # Track attack vector stats
+        if attack_vector not in attack_vector_stats:
+            attack_vector_stats[attack_vector] = {"total": 0, "passed": 0, "failed": 0}
+        attack_vector_stats[attack_vector]["total"] += 1
+        
+        # Track risk level stats
+        if risk_level not in risk_level_stats:
+            risk_level_stats[risk_level] = {"total": 0, "passed": 0, "failed": 0}
+        risk_level_stats[risk_level]["total"] += 1
+        
+        stats["total"] += 1
+        
         try:
-            progress_bar.progress((i + 1) / len(test_cases))
-            test_name = test_case.get('name', f'Test {i+1}')
-            status_text.text(f"Executing test {i+1}/{len(test_cases)}: {test_name}")
-            
-            category = test_case.get("category", "unknown")
-            
-            if category not in category_stats:
-                category_stats[category] = {"total": 0, "passed": 0, "failed": 0}
-            category_stats[category]["total"] += 1
-            stats["total"] += 1
-            
-            # Extract test parameters with defaults
             method = test_case.get("method", "GET")
             payload = test_case.get("payload")
-            test_headers = test_case.get("headers", {})
+            headers = {**base_headers, **(test_case.get("headers", {}) or {})}
             expected_status = test_case.get("expected_status_code", 200)
-            risk_level = test_case.get("risk_level", "MEDIUM")
             
-            # Merge headers safely
-            merged_headers = {}
-            if base_headers:
-                merged_headers.update(base_headers)
-            if test_headers:
-                merged_headers.update(test_headers)
+            response = make_request(method, api_endpoint, payload, headers)
             
-            # Execute the request
-            response = make_request(method, api_endpoint, payload, merged_headers)
+            status_matches = response.status_code == expected_status
             
-            # Check if it's our mock response (error case)
-            if hasattr(response, 'error') or response.status_code == 999:
-                stats["errors"] += 1
-                category_stats[category]["failed"] += 1
-                
-                results.append({
-                    "test_name": test_name,
-                    "category": category,
-                    "description": test_case.get("description", ""),
-                    "method": method,
-                    "payload": str(payload) if payload else "",
-                    "headers": str(test_headers),
-                    "expected_status": expected_status,
-                    "actual_status": response.status_code,
-                    "response_body": response.text[:200],
-                    "response_time": 0,
-                    "status_matches": False,
-                    "risk_level": risk_level,
-                    "coverage_area": test_case.get("coverage_area", ""),
-                    "test_result": "ERROR",
-                    "error": response.text
-                })
+            if status_matches:
+                stats["passed"] += 1
+                attack_vector_stats[attack_vector]["passed"] += 1
+                risk_level_stats[risk_level]["passed"] += 1
             else:
-                # Normal response handling
-                status_matches = response.status_code == expected_status
-                
-                if status_matches:
-                    stats["passed"] += 1
-                    category_stats[category]["passed"] += 1
-                else:
-                    stats["failed"] += 1
-                    category_stats[category]["failed"] += 1
-                
-                results.append({
-                    "test_name": test_name,
-                    "category": category,
-                    "description": test_case.get("description", ""),
-                    "method": method,
-                    "payload": str(payload) if payload else "",
-                    "headers": str(test_headers),
-                    "expected_status": expected_status,
-                    "actual_status": response.status_code,
-                    "response_body": response.text[:200] if hasattr(response, 'text') else "",
-                    "response_time": response.elapsed.total_seconds() if hasattr(response, 'elapsed') else 0,
-                    "status_matches": status_matches,
-                    "risk_level": risk_level,
-                    "coverage_area": test_case.get("coverage_area", ""),
-                    "test_result": "PASS" if status_matches else "FAIL"
-                })
-                
-        except Exception as e:
-            stats["errors"] += 1
-            if category in category_stats:
-                category_stats[category]["failed"] += 1
-            
-            st.error(f"Error executing test {i+1}: {str(e)}")
-            st.code(traceback.format_exc())
+                stats["failed"] += 1
+                attack_vector_stats[attack_vector]["failed"] += 1
+                risk_level_stats[risk_level]["failed"] += 1
             
             results.append({
-                "test_name": test_case.get("name", f"Test {i+1}"),
-                "category": test_case.get("category", "unknown"),
+                "test_name": test_case["name"],
+                "attack_vector": attack_vector,
+                "code_target": test_case.get("code_target", ""),
+                "description": test_case.get("description", ""),
+                "method": method,
+                "payload": str(payload) if payload else "",
+                "headers": str(test_case.get("headers", {})),
+                "expected_status": expected_status,
+                "actual_status": response.status_code,
+                "response_body": response.text[:500],
+                "response_time": response.elapsed.total_seconds(),
+                "status_matches": status_matches,
+                "risk_level": risk_level,
+                "test_result": "PASS" if status_matches else "FAIL"
+            })
+            
+        except Exception as e:
+            stats["errors"] += 1
+            attack_vector_stats[attack_vector]["failed"] += 1
+            risk_level_stats[risk_level]["failed"] += 1
+            
+            results.append({
+                "test_name": test_case["name"],
+                "attack_vector": attack_vector,
+                "code_target": test_case.get("code_target", ""),
                 "description": test_case.get("description", ""),
                 "error": str(e),
                 "status_matches": False,
-                "risk_level": test_case.get("risk_level", "MEDIUM"),
-                "coverage_area": test_case.get("coverage_area", ""),
+                "risk_level": risk_level,
                 "test_result": "ERROR"
             })
     
-    status_text.text("Test execution completed!")
-    return results, stats, category_stats
+    status_text.text("✅ Test execution completed!")
+    return results, stats, attack_vector_stats, risk_level_stats
 
-def create_excel_download(results, stats, category_stats):
+def make_request(method, url, payload=None, headers=None):
+    """Make HTTP request"""
+    
+    request_kwargs = {
+        "url": url,
+        "headers": headers or {"Content-Type": "application/json"},
+        "timeout": 10
+    }
+    
+    if method.upper() in ["POST", "PUT", "PATCH"] and payload is not None:
+        if isinstance(payload, dict):
+            request_kwargs["json"] = payload
+        else:
+            request_kwargs["data"] = str(payload)
+    elif method.upper() == "GET" and payload:
+        request_kwargs["params"] = payload if isinstance(payload, dict) else {"q": str(payload)}
+    
+    return requests.request(method, **request_kwargs)
+
+def create_excel_download(results, stats, attack_vector_stats, risk_level_stats):
     """Create Excel file with detailed results"""
     
     # Create a BytesIO buffer
@@ -647,18 +994,31 @@ def create_excel_download(results, stats, category_stats):
         summary_df = pd.DataFrame(summary_data)
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
         
-        # Category breakdown sheet
-        category_data = []
-        for category, cat_stats in category_stats.items():
-            category_data.append({
-                "Category": category.replace('_', ' ').title(),
-                "Total Tests": cat_stats["total"],
-                "Passed": cat_stats["passed"],
-                "Failed": cat_stats["failed"],
-                "Success Rate (%)": round((cat_stats["passed"] / cat_stats["total"] * 100) if cat_stats["total"] > 0 else 0, 2)
+        # Attack vector breakdown sheet
+        attack_data = []
+        for attack_vector, av_stats in attack_vector_stats.items():
+            attack_data.append({
+                "Attack Vector": attack_vector,
+                "Total Tests": av_stats["total"],
+                "Passed": av_stats["passed"],
+                "Failed": av_stats["failed"],
+                "Success Rate (%)": round((av_stats["passed"] / av_stats["total"] * 100) if av_stats["total"] > 0 else 0, 2)
             })
-        category_df = pd.DataFrame(category_data)
-        category_df.to_excel(writer, sheet_name='Category Breakdown', index=False)
+        attack_df = pd.DataFrame(attack_data)
+        attack_df.to_excel(writer, sheet_name='Attack Vectors', index=False)
+        
+        # Risk level breakdown sheet
+        risk_data = []
+        for risk_level, risk_stats in risk_level_stats.items():
+            risk_data.append({
+                "Risk Level": risk_level,
+                "Total Tests": risk_stats["total"],
+                "Passed": risk_stats["passed"],
+                "Failed": risk_stats["failed"],
+                "Success Rate (%)": round((risk_stats["passed"] / risk_stats["total"] * 100) if risk_stats["total"] > 0 else 0, 2)
+            })
+        risk_df = pd.DataFrame(risk_data)
+        risk_df.to_excel(writer, sheet_name='Risk Levels', index=False)
         
         # Detailed results sheet
         results_df = pd.DataFrame(results)
@@ -669,13 +1029,19 @@ def create_excel_download(results, stats, category_stats):
         if failed_tests:
             failed_df = pd.DataFrame(failed_tests)
             failed_df.to_excel(writer, sheet_name='Failed Tests', index=False)
+        
+        # High risk failures sheet
+        high_risk_failures = [r for r in results if not r.get("status_matches", False) and r.get("risk_level", "").upper() in ["HIGH", "CRITICAL"]]
+        if high_risk_failures:
+            high_risk_df = pd.DataFrame(high_risk_failures)
+            high_risk_df.to_excel(writer, sheet_name='High Risk Failures', index=False)
     
     buffer.seek(0)
     return buffer
 
 # Main Streamlit App
 def main():
-    st.markdown('<div class="main-header">GPT API Security Tester</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">🔒 Context-Aware API Security Tester</div>', unsafe_allow_html=True)
     
     # Get API key from user
     user_api_key = st.text_input("Enter your OpenAI API key:", type="password")
@@ -693,123 +1059,413 @@ def main():
     
     st.success("OpenAI API connected successfully!")
     
-    # Main content area - Flask Code Input
-    st.header("Flask API Code Analysis")
+    # Initialize session state
+    if 'parsed_endpoints' not in st.session_state:
+        st.session_state.parsed_endpoints = None
+    if 'code_analysis' not in st.session_state:
+        st.session_state.code_analysis = None
+    if 'test_config' not in st.session_state:
+        st.session_state.test_config = None
+    if 'test_cases' not in st.session_state:
+        st.session_state.test_cases = None
+    if 'test_results' not in st.session_state:
+        st.session_state.test_results = None
     
-    # Code input section
-    flask_code = st.text_area(
-        "Paste your Flask API code here:",
-        height=300,
-        placeholder="""# Example:
-from flask import Flask, request, jsonify
-app = Flask(__name__)
+    # Main Input Section
+    st.header("📝 API Code Input")
+    
+    # Framework detection info
+    st.info("""
+    **🎯 Context-Aware Analysis - Supported Technologies:**
+    - 🐍 **Flask/FastAPI/Django** - Python web frameworks
+    - ⚡ **AWS Lambda** - Serverless functions with API Gateway
+    - 🟢 **Express.js/Node.js** - JavaScript backend frameworks  
+    - ☕ **Spring Boot** - Java enterprise applications
+    - 🔷 **ASP.NET Core** - .NET web APIs
+    - 📦 **Generic REST APIs** - Any HTTP-based API implementation
+    
+    **🧠 Intelligent Analysis Features:**
+    - **Code Context Analysis** - Understands your actual implementation
+    - **Security Pattern Detection** - Identifies auth, validation, business logic
+    - **Vulnerability Mapping** - Maps code patterns to attack vectors
+    - **Flow Analysis** - Understands request/response patterns
+    """)
+    
+    # Input method tabs
+    input_tab1, input_tab2 = st.tabs(["📝 Paste Code", "📁 Upload Files"])
+    
+    with input_tab1:
+        # Code input section
+        api_code = st.text_area(
+            "Paste your API code here:",
+            height=350,
+            placeholder="""# Your complete API implementation - the more complete, the better the analysis!
 
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.json or {}
-    username = data.get("username")
-    password = data.get("password")
-    # ... rest of your code
-""",
-        help="Paste your complete Flask API code. The app will automatically detect endpoints and methods."
-    )
+# Flask Example:
+@app.route("/api/users/<int:user_id>", methods=["GET", "PUT"])
+@login_required
+def user_profile(user_id):
+    if not current_user.is_admin and current_user.id != user_id:
+        return {"error": "Access denied"}, 403
     
-    # Base URL input
-    col1, col2 = st.columns([2, 1])
+    if request.method == "PUT":
+        data = request.get_json()
+        email = data.get("email")
+        if email and not validate_email(email):
+            return {"error": "Invalid email"}, 400
+            
+        user = User.query.filter_by(id=user_id).first()
+        if user:
+            user.email = email
+            db.session.commit()
+            return {"status": "updated"}, 200
+    
+    return User.query.get_or_404(user_id).to_dict()
+
+# AWS Lambda Example:
+def lambda_handler(event, context):
+    method = event['httpMethod']
+    path_params = event.get('pathParameters', {})
+    
+    if method == 'POST':
+        body = json.loads(event['body'])
+        username = body.get('username')
+        password = body.get('password')
+        
+        if not username or len(username) < 3:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Username too short'})
+            }
+            
+        # Authentication logic here
+        if authenticate_user(username, password):
+            token = generate_jwt_token(username)
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'token': token})
+            }
+        else:
+            return {
+                'statusCode': 401,
+                'body': json.dumps({'error': 'Invalid credentials'})
+            }
+""",
+            help="Paste your complete API code. The more detailed the code, the more specific and targeted the security tests will be.",
+            key="code_input"
+        )
+    
+    with input_tab2:
+        # File upload section
+        st.markdown('<div class="upload-section">', unsafe_allow_html=True)
+        uploaded_files = st.file_uploader(
+            "Upload your API code files:",
+            accept_multiple_files=True,
+            type=['py', 'js', 'ts', 'java', 'php', 'rb', 'go', 'rs', 'txt', 'zip'],
+            help="Upload individual code files or ZIP archives containing your complete API implementation"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        api_code_from_files = ""
+        if uploaded_files:
+            with st.spinner("Reading and analyzing uploaded files..."):
+                file_content, file_info = read_uploaded_files(uploaded_files)
+                api_code_from_files = file_content
+                
+                if file_info:
+                    st.success(f"✅ Successfully read {len(file_info)} files")
+                    
+                    # Show file summary
+                    with st.expander("📋 Uploaded Files Summary", expanded=False):
+                        for file in file_info:
+                            st.write(f"**{file['name']}** - {file['size']} characters ({file['type']})")
+                    
+                    # Show preview of content
+                    with st.expander("👀 Code Preview", expanded=False):
+                        st.code(file_content[:2000] + "..." if len(file_content) > 2000 else file_content, 
+                               language='python')
+    
+    # Combine code from both sources
+    final_code = api_code if api_code.strip() else api_code_from_files
+    
+    # Context Information Section
+    st.header("🔧 Additional Context (Recommended)")
+    st.info("""
+    **🚀 Enhance Analysis with Real-World Context:**
+    - 📡 **cURL Commands** - Actual API calls you've tested
+    - 🔗 **API URLs** - Complete endpoint URLs with domains
+    - 📄 **API Documentation** - Swagger/OpenAPI specifications
+    - 🔑 **Authentication Examples** - Headers, tokens, API keys
+    - 🌐 **Base URLs** - Production/staging server endpoints
+    - 📊 **Expected Behaviors** - Normal vs error responses
+    
+    **💡 Pro Tip:** The more context you provide, the more targeted and effective the security tests become!
+    """)
+    
+    col1, col2 = st.columns([3, 1])
+    
     with col1:
-        base_url = st.text_input(
-            "Base URL for your API:",
-            value="https://jsonplaceholder.typicode.com",
-            help="Enter the base URL where your Flask API is running"
+        context_info = st.text_area(
+            "Additional Context (cURL commands, URLs, documentation, etc.):",
+            height=150,
+            placeholder="""Real-world examples that help create better tests:
+
+# Example cURL command:
+curl -X POST "https://api.myapp.com/auth/login" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Version: 1.0" \
+  -d '{"username":"john@example.com","password":"secure123"}'
+
+# Base URL:
+https://api.myapp.com
+
+# Authentication:
+- Uses JWT tokens in Authorization header
+- Admin endpoints require "X-Admin-Key" header
+- Rate limit: 100 requests/minute per IP
+
+# Expected responses:
+- Success: 200 with JSON
+- Validation errors: 422 with error details
+- Auth failures: 401 with error message
+
+# Business rules:
+- Users can only access their own data unless admin
+- Email must be unique in system
+- Passwords must be at least 8 characters
+""",
+            help="This context helps generate tests that target your specific implementation and real attack scenarios",
+            key="context_input"
         )
     
     with col2:
-        analyze_button = st.button("Analyze Code", type="primary", use_container_width=True)
+        base_url = st.text_input(
+            "Base URL:",
+            value="",
+            placeholder="https://api.example.com",
+            help="Primary base URL where your API is deployed",
+            key="base_url_input"
+        )
     
-    # Initialize session state for parsed endpoints
-    if 'parsed_endpoints' not in st.session_state:
-        st.session_state.parsed_endpoints = None
+    # Analysis Button
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        analyze_button = st.button("Analyze Code and Generate Endpoints", type="primary", use_container_width=True, disabled=not final_code.strip())
     
-    # Analyze Flask code
-    if analyze_button and flask_code.strip():
-        with st.spinner("Analyzing Flask API code..."):
-            endpoints = parse_flask_code(flask_code)
+    # Analyze API code
+    if analyze_button and final_code.strip():
+        with st.spinner("🔍 Performing deep code analysis and security intelligence gathering..."):
+            # Parse the main code
+            endpoints = parse_api_code(final_code)
+            
+            # Perform comprehensive code analysis
+            code_analysis = analyze_code_context(final_code, context_info)
+            
+            # Enhance with context information
+            if context_info.strip() or base_url.strip():
+                context_combined = f"{context_info}\nBase URL: {base_url}".strip()
+                endpoints = enhance_endpoints_with_context(endpoints, context_combined)
+            
             st.session_state.parsed_endpoints = endpoints
+            st.session_state.code_analysis = code_analysis
             
             if endpoints:
-                st.success(f"Found {len(endpoints)} endpoint(s)!")
+                frameworks = list(set([ep.get('type', 'unknown') for ep in endpoints]))
+                st.success(f"✅ Found {len(endpoints)} endpoint(s) across {len(frameworks)} framework(s): {', '.join(frameworks).title()}")
+                
+                # Show detailed analysis results
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("🔍 Code Analysis Results")
+                    
+                    if code_analysis['authentication_methods']:
+                        st.write(f"🔐 **Authentication:** {', '.join(code_analysis['authentication_methods'])}")
+                    if code_analysis['validation_patterns']:
+                        st.write(f"✅ **Validation:** {', '.join(code_analysis['validation_patterns'])}")
+                    if code_analysis['security_controls']:
+                        st.write(f"🛡️ **Security Controls:** {', '.join(code_analysis['security_controls'])}")
+                    if code_analysis['database_operations']:
+                        st.write(f"💾 **Database Ops:** {', '.join(code_analysis['database_operations'])}")
+                
+                with col2:
+                    st.subheader("🎯 Attack Surface Analysis")
+                    
+                    if code_analysis['business_logic']:
+                        st.write(f"🧠 **Business Logic:** {', '.join(code_analysis['business_logic'])}")
+                    if code_analysis['input_sources']:
+                        st.write(f"📥 **Input Sources:** {', '.join(code_analysis['input_sources'])}")
+                    if code_analysis['error_handling']:
+                        st.write(f"⚠️ **Error Handling:** {', '.join(code_analysis['error_handling'])}")
+                    if code_analysis['file_operations']:
+                        st.write(f"📁 **File Operations:** {', '.join(code_analysis['file_operations'])}")
+                
+                # Framework breakdown
+                framework_counts = {}
+                for ep in endpoints:
+                    fw = ep.get('type', 'unknown')
+                    framework_counts[fw] = framework_counts.get(fw, 0) + 1
+                
+                breakdown = " | ".join([f"{fw.title()}: {count}" for fw, count in framework_counts.items()])
+                st.info(f"📊 **Framework Breakdown:** {breakdown}")
+                
+                # Context enhancements
+                context_enhanced = [ep for ep in endpoints if ep.get('full_url') or ep.get('headers')]
+                if context_enhanced:
+                    st.info(f"🔧 **Context Enhanced:** {len(context_enhanced)} endpoints enhanced with additional context")
+                    
             else:
-                st.error("No Flask routes found. Please check your code format.")
+                st.error("❌ No API endpoints found. Please check your code format or provide additional context.")
+                st.info("""
+                **Troubleshooting Tips:**
+                - Ensure your code contains actual API route definitions (Flask @app.route, Lambda handlers, etc.)
+                - Try adding cURL commands or API URLs in the context section
+                - Check that your code includes the actual function implementations, not just imports
+                - Make sure file uploads contain actual code files, not just documentation
+                """)
     
-    # Display parsed endpoints and configuration
-    if st.session_state.parsed_endpoints:
+    # Endpoint Selection & Configuration
+    if st.session_state.parsed_endpoints and st.session_state.code_analysis:
         endpoints = st.session_state.parsed_endpoints
-        
-        # Create endpoint options
+        code_analysis = st.session_state.code_analysis
         endpoint_options = create_endpoint_selector(endpoints, base_url)
         
         if endpoint_options:
-            st.header("Endpoint Selection & Configuration")
+            st.header("Endpoint Configuration")
             
             # Endpoint selector
             selected_option = st.selectbox(
-                "Select an endpoint to test:",
+                "Select an endpoint for comprehensive security testing:",
                 options=range(len(endpoint_options)),
                 format_func=lambda x: endpoint_options[x]['display'],
-                help="Choose which endpoint you want to security test"
+                help="Choose which endpoint you want to perform deep security analysis on"
             )
             
             if selected_option is not None:
                 selected_endpoint = endpoint_options[selected_option]
+                endpoint_details = selected_endpoint['endpoint_details']
                 
-                # Display selected endpoint details
+                # Display comprehensive endpoint analysis
+                st.subheader("📋 Endpoint Report")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.write(f"**URL:** `{selected_endpoint['url']}`")
+                    st.write(f"**Method:** `{selected_endpoint['method']}`")
+                    st.write(f"**Framework:** `{selected_endpoint['type'].title()}`")
+                
+                with col2:
+                    st.write(f"**Function:** `{endpoint_details.get('function_name', 'N/A')}`")
+                    expected_fields = endpoint_details.get('expected_fields', [])
+                    st.write(f"**Expected Fields:** {len(expected_fields)}")
+                    if expected_fields:
+                        st.write(f"*{', '.join(expected_fields[:5])}{'...' if len(expected_fields) > 5 else ''}*")
+                
+                with col3:
+                    st.write(f"**Expected Status Codes:** {selected_endpoint['expected_statuses']}")
+                    path_params = endpoint_details.get('path_parameters', [])
+                    query_params = endpoint_details.get('query_parameters', [])
+                    st.write(f"**Parameters:** Path({len(path_params)}) Query({len(query_params)})")
+                
+                # Security Analysis for this endpoint
+                if endpoint_details.get('function_body'):
+                    with st.expander("🔍 Security Analysis for this Endpoint", expanded=True):
+                        func_body = endpoint_details['function_body']
+                        
+                        # Analyze specific patterns in this function
+                        security_findings = []
+                        
+                        if 'password' in func_body.lower() and 'hash' not in func_body.lower():
+                            security_findings.append("⚠️ **Password Handling**: Potential plaintext password handling detected")
+                        
+                        if 'sql' in func_body.lower() and 'parameterized' not in func_body.lower():
+                            security_findings.append("🔴 **SQL Injection Risk**: Direct SQL queries detected without parameterization")
+                        
+                        if 'admin' in func_body.lower() and 'check' not in func_body.lower():
+                            security_findings.append("🟠 **Authorization Risk**: Admin functionality may lack proper authorization checks")
+                        
+                        if 'json.loads' in func_body and 'validate' not in func_body.lower():
+                            security_findings.append("🟡 **Input Validation**: JSON parsing without validation detected")
+                        
+                        if re.search(r'return.*error', func_body, re.IGNORECASE):
+                            security_findings.append("ℹ️ **Error Handling**: Error responses detected - potential information disclosure")
+                        
+                        if security_findings:
+                            for finding in security_findings:
+                                st.markdown(finding)
+                        else:
+                            st.success("✅ No obvious security concerns detected in this endpoint")
+                
+                # Auto-detected sample payload with intelligent enhancement
+                st.subheader("detected Payload Configuration")
+                
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.subheader("Endpoint Details")
-                    st.write(f"**URL:** `{selected_endpoint['url']}`")
-                    st.write(f"**Method:** `{selected_endpoint['method']}`")
-                    st.write(f"**Expected Status Codes:** {selected_endpoint['expected_statuses']}")
-                
-                with col2:
-                    st.subheader("Auto-detected Sample Payload")
+                    st.write("**Auto-detected Sample Payload:**")
                     if selected_endpoint['payload']:
                         st.json(selected_endpoint['payload'])
                     else:
                         st.info("No payload detected (likely GET endpoint)")
                 
+                with col2:
+                    st.write("**Detected Input Sources:**")
+                    input_sources = code_analysis.get('input_sources', [])
+                    if input_sources:
+                        for source in input_sources:
+                            st.write(f"• {source.replace('_', ' ').title()}")
+                    else:
+                        st.info("No specific input sources detected")
+                
                 # Configuration section
-                st.subheader("Test Configuration")
+                st.subheader("⚙️ Edit Test Configuration")
                 
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    # Allow manual payload editing
-                    manual_payload = st.text_area(
+                    # Allow manual payload editing with intelligent suggestions
+                    payload_help = "Modify the auto-detected payload. "
+                    if endpoint_details.get('expected_fields'):
+                        payload_help += f"Expected fields: {', '.join(endpoint_details['expected_fields'])}"
+                    
+                    manual_payload_edit = st.text_area(
                         "Edit Sample Payload (JSON):",
                         value=json.dumps(selected_endpoint['payload'], indent=2) if selected_endpoint['payload'] else "{}",
-                        help="Modify the auto-detected payload or add your own"
+                        help=payload_help,
+                        height=200
                     )
                 
                 with col2:
-                    # Custom headers
+                    # Custom headers with intelligent defaults
+                    default_headers = {"Content-Type": "application/json"}
+                    if selected_endpoint.get('headers'):
+                        default_headers.update(selected_endpoint['headers'])
+                    
+                    # Add authentication headers based on analysis
+                    if 'token_auth' in code_analysis.get('authentication_methods', []):
+                        default_headers["Authorization"] = "Bearer your_token_here"
+                    if 'api_key' in code_analysis.get('authentication_methods', []):
+                        default_headers["X-API-Key"] = "your_api_key_here"
+                    
                     custom_headers_input = st.text_area(
                         "Custom Headers (JSON):",
-                        value='{"Content-Type": "application/json"}',
-                        help="Add any custom headers needed for authentication, etc."
+                        value=json.dumps(default_headers, indent=2),
+                        help="Headers configured based on detected authentication methods",
+                        height=200
                     )
                 
                 # Parse the inputs
                 try:
-                    sample_payload = json.loads(manual_payload) if manual_payload.strip() else {}
+                    sample_payload = json.loads(manual_payload_edit) if manual_payload_edit.strip() else {}
                 except json.JSONDecodeError:
-                    st.error("Invalid JSON in payload. Please check your format.")
+                    st.error("❌ Invalid JSON in payload. Please check your format.")
                     return
                 
                 try:
                     custom_headers = json.loads(custom_headers_input) if custom_headers_input.strip() else {}
                 except json.JSONDecodeError:
-                    st.error("Invalid JSON in headers. Please check your format.")
+                    st.error("❌ Invalid JSON in headers. Please check your format.")
                     return
                 
                 # Store configuration in session state
@@ -817,232 +1473,492 @@ def login():
                     'api_endpoint': selected_endpoint['url'],
                     'http_method': selected_endpoint['method'],
                     'sample_payload': sample_payload,
-                    'custom_headers': custom_headers
+                    'custom_headers': custom_headers,
+                    'endpoint_details': endpoint_details
                 }
                 
-                # Initialize test-related session state
-                if 'test_cases' not in st.session_state:
-                    st.session_state.test_cases = None
-                if 'test_results' not in st.session_state:
-                    st.session_state.test_results = None
+                # Show configuration readiness
+                st.success("✅ Configuration ready for intelligent security testing!")
                 
-                # Test case generation section
-                st.header("Test Case Generation")
-                
-                col1, col2 = st.columns([1, 1])
-                
-                with col1:
-                    if st.button("Generate Test Cases", type="primary", use_container_width=True):
-                        config = st.session_state.test_config
-                        with st.spinner("Generating comprehensive test cases..."):
-                            st.session_state.test_cases = generate_comprehensive_test_cases(
-                                client, 
-                                config['api_endpoint'], 
-                                config['http_method'], 
-                                config['sample_payload'], 
-                                config['custom_headers']
-                            )
-                
-                with col2:
-                    if st.session_state.test_cases:
-                        st.metric("Generated Test Cases", len(st.session_state.test_cases))
-                
-                # Display generated test cases
-                if st.session_state.test_cases:
-                    st.success(f"Successfully generated {len(st.session_state.test_cases)} test cases!")
-                    categories = {}
-                    for test in st.session_state.test_cases:
-                        category = test.get('category', 'unknown')
-                        categories[category] = categories.get(category, 0) + 1
-                    category_info = " | ".join([f"{cat.replace('_', ' ').title()}: {count}" for cat, count in categories.items()])
-                    st.info(f"**Category Breakdown:** {category_info}")
+                # Show what will be tested based on analysis
+                with st.expander("🎯 Planned Test Coverage Based on Code Analysis", expanded=False):
+                    st.write("**The following test categories will be generated based on your code:**")
                     
-                    # Test cases preview
-                    with st.expander("Detailed Test Cases Report", expanded=False):
-                        for i, test in enumerate(st.session_state.test_cases, 1):
-                            st.markdown("---")  # Separator line
-                            
-                            # Test details in your requested format
-                            st.markdown(f"**Test:** {test.get('name', 'Unnamed Test')}")
-                            st.markdown(f"**Category:** `{test.get('category', 'unknown')}`")
-                            st.markdown(f"**Coverage Area:** {test.get('coverage_area', 'General testing')}")
-                            
-                            # Expected vs Got format
-                            expected = test.get('expected_status_code', 200)
-                            got = test.get('actual_status_code', 'Not executed yet')
-                            
-                            st.markdown(f"**Expected:** {expected} | **Got:** {got}")
-                            
-                            # Match status with visual indicator
-                            if got == 'Not executed yet':
-                                st.markdown("**Match:** Not tested")
-                            elif expected == got:
-                                st.markdown("**Match:** True")
-                            else:
-                                st.markdown("**Match:** False")
-                            
-                            # Description
-                            st.markdown(f"**Description:** {test.get('description', 'No description available')}")
-                            
-                            # Additional details in expandable section
-                            with st.expander(f"Technical Details - Test {i}", expanded=False):
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.markdown(f"**Method:** {test.get('method', 'GET')}")
-                                    st.markdown(f"**Risk Level:** {test.get('risk_level', 'MEDIUM')}")
-                                with col2:
-                                    if test.get('payload'):
-                                        st.markdown("**Payload:**")
-                                        st.code(json.dumps(test['payload'], indent=2), language='json')
-                                    if test.get('headers'):
-                                        st.markdown("**Headers:**")
-                                        st.code(json.dumps(test['headers'], indent=2), language='json')
-                
-                # Test execution section
-                if st.session_state.test_cases:
-                    st.header("Test Execution")
-                    
-                    col1, col2 = st.columns([1, 1])
+                    col1, col2 = st.columns(2)
                     
                     with col1:
-                        if st.button("Execute Tests", type="primary", use_container_width=True):
-                            config = st.session_state.test_config
-                            base_headers = {"Content-Type": "application/json", **config['custom_headers']}
-                            
-                            with st.spinner("Executing tests..."):
-                                results, stats, category_stats = execute_tests(
-                                    st.session_state.test_cases, 
-                                    config['api_endpoint'], 
-                                    base_headers
-                                )
-                                st.session_state.test_results = {
-                                    'results': results,
-                                    'stats': stats,
-                                    'category_stats': category_stats
-                                }
+                        st.write("**🔒 Security Tests:**")
+                        if code_analysis.get('authentication_methods'):
+                            st.write("• Authentication bypass attempts")
+                        if code_analysis.get('database_operations'):
+                            st.write("• SQL injection variations")
+                        if code_analysis.get('validation_patterns'):
+                            st.write("• Input validation bypass")
+                        if code_analysis.get('business_logic'):
+                            st.write("• Business logic manipulation")
+                        
+                        st.write("**⚡ Flow & Logic Tests:**")
+                        if 'role_based_logic' in code_analysis.get('business_logic', []):
+                            st.write("• Role/permission escalation")
+                        if 'state_dependent_logic' in code_analysis.get('business_logic', []):
+                            st.write("• State transition attacks")
+                        if 'workflow_logic' in code_analysis.get('business_logic', []):
+                            st.write("• Workflow sequence bypass")
                     
-                    # Display results
-                    if st.session_state.test_results:
-                        stats = st.session_state.test_results['stats']
-                        category_stats = st.session_state.test_results['category_stats']
-                        results = st.session_state.test_results['results']
+                    with col2:
+                        st.write("**📊 Boundary Tests:**")
+                        if 'length_validation' in code_analysis.get('validation_patterns', []):
+                            st.write("• Field length boundary testing")
+                        if 'range_validation' in code_analysis.get('validation_patterns', []):
+                            st.write("• Numeric range violations")
+                        if 'type_validation' in code_analysis.get('validation_patterns', []):
+                            st.write("• Data type confusion")
                         
-                        st.header("Test Results")
+                        st.write("**🎭 Edge Cases:**")
+                        st.write("• Null/empty value handling")
+                        st.write("• Unicode & special characters")
+                        st.write("• Malformed data structures")
+                        if code_analysis.get('file_operations'):
+                            st.write("• File upload/download abuse")
+    
+    # Context-Aware Test Case Generation and Execution
+    if st.session_state.test_config and st.session_state.code_analysis:
+        config = st.session_state.test_config
+        code_analysis = st.session_state.code_analysis
+        
+        # Show current configuration
+        st.header("Security Test Generation")
+        
+        # Configuration summary
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Endpoint", config['api_endpoint'].split('/')[-1] if config['api_endpoint'] else "Unknown")
+        with col2:
+            st.metric("Method", config['http_method'])
+        with col3:
+            payload_count = len(config['sample_payload']) if config['sample_payload'] else 0
+            st.metric("Payload Fields", payload_count)
+        with col4:
+            analysis_areas = len([v for v in code_analysis.values() if v])
+            st.metric("Analysis Areas", analysis_areas)
+        
+        # Test case generation section
+        st.subheader("🚀 Generate Context-Aware Security Tests")
+        
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            if st.button("Generate Context-Aware Tests", type="primary", use_container_width=True):
+                with st.spinner("🔍 Analyzing code patterns and generating intelligent security tests..."):
+                    st.session_state.test_cases = generate_context_aware_test_cases(
+                        client, 
+                        config['api_endpoint'], 
+                        config['http_method'], 
+                        config['sample_payload'], 
+                        config['custom_headers'],
+                        code_analysis,
+                        config['endpoint_details']
+                    )
+        
+        with col2:
+            if st.session_state.test_cases:
+                test_count = len(st.session_state.test_cases)
+                st.metric("Generated Tests", test_count)
+                
+                # Show distribution by risk level
+                risk_dist = {}
+                for test in st.session_state.test_cases:
+                    risk = test.get('risk_level', 'MEDIUM')
+                    risk_dist[risk] = risk_dist.get(risk, 0) + 1
+                
+                if risk_dist:
+                    risk_info = " | ".join([f"{risk}: {count}" for risk, count in sorted(risk_dist.items())])
+                    st.caption(f"Risk Distribution: {risk_info}")
+        
+        # Display generated test cases with enhanced information
+        if st.session_state.test_cases:
+            st.success(f"✅ Successfully generated {len(st.session_state.test_cases)} context-aware test cases!")
+            
+            # Test categorization by attack vector
+            attack_vectors = {}
+            for test in st.session_state.test_cases:
+                vector = test.get('attack_vector', 'General Testing')
+                attack_vectors[vector] = attack_vectors.get(vector, 0) + 1
+            
+            vector_info = " | ".join([f"{vector}: {count}" for vector, count in sorted(attack_vectors.items())])
+            st.info(f"🎯 **Attack Vector Coverage:** {vector_info}")
+            
+            # Test cases preview with enhanced details
+            with st.expander("📋 Context-Aware Test Cases Report", expanded=False):
+                for i, test in enumerate(st.session_state.test_cases, 1):
+                    st.markdown("---")
+                    
+                    # Test header with risk indicator
+                    risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🟠", "CRITICAL": "🔴"}.get(test.get('risk_level', 'MEDIUM'), "⚪")
+                    st.markdown(f"**Test {i}:** {test.get('name', 'Unnamed Test')} {risk_emoji}")
+                    
+                    # Main test information
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown(f"**Attack Vector:** `{test.get('attack_vector', 'General')}`")
+                        st.markdown(f"**Code Target:** {test.get('code_target', 'General endpoint')}")
+                        st.markdown(f"**Risk Level:** {test.get('risk_level', 'MEDIUM')}")
+                    
+                    with col2:
+                        expected = test.get('expected_status_code', 200)
+                        got = test.get('actual_status_code', 'Not executed yet')
+                        st.markdown(f"**Expected:** {expected} | **Got:** {got}")
                         
-                        # Overall metrics
-                        col1, col2, col3, col4 = st.columns(4)
-                        
-                        with col1:
-                            st.metric("Total Tests", stats['total'])
-                        with col2:
-                            st.metric("Passed", stats['passed'], delta=f"{stats['passed']/stats['total']*100:.1f}%")
-                        with col3:
-                            st.metric("Failed", stats['failed'], delta=f"{stats['failed']/stats['total']*100:.1f}%")
-                        with col4:
-                            st.metric("Errors", stats['errors'])
-                        
-                        # Category breakdown
-                        st.subheader("Results by Category")
-                        
-                        category_data = []
-                        for category, cat_stats in category_stats.items():
-                            success_rate = (cat_stats["passed"] / cat_stats["total"] * 100) if cat_stats["total"] > 0 else 0
-                            category_data.append({
-                                "Category": category.replace('_', ' ').title(),
-                                "Total": cat_stats["total"],
-                                "Passed": cat_stats["passed"],
-                                "Failed": cat_stats["failed"],
-                                "Success Rate": f"{success_rate:.1f}%"
-                            })
-                        
-                        category_df = pd.DataFrame(category_data)
-                        st.dataframe(category_df, use_container_width=True)
-                        
-                        # Failed tests summary
-                        failed_tests = [r for r in results if not r.get("status_matches", False)]
-                        if failed_tests:
-                            st.subheader("Failed Tests Summary")
-                            
-                            high_risk_failures = [r for r in failed_tests if r.get("risk_level", "").upper() in ["HIGH", "CRITICAL"]]
-                            if high_risk_failures:
-                                st.error(f"ALERT: {len(high_risk_failures)} high-risk failures detected!")
-                            
-                            # Show failed tests table
-                            failed_df = pd.DataFrame(failed_tests)
-                            display_columns = ['test_name', 'category', 'expected_status', 'actual_status', 'risk_level', 'test_result']
-                            available_columns = [col for col in display_columns if col in failed_df.columns]
-                            st.dataframe(failed_df[available_columns], use_container_width=True)
-                        
-                        # Download section
-                        st.subheader("Download Results")
-                        
+                        # Match status with visual indicator
+                        if got == 'Not executed yet':
+                            st.markdown("**Status:** ⏳ Not tested")
+                        elif expected == got:
+                            st.markdown("**Status:** ✅ Passed")
+                        else:
+                            st.markdown("**Status:** ❌ Failed")
+                    
+                    # Description
+                    st.markdown(f"**Description:** {test.get('description', 'No description available')}")
+                    
+                    # Technical details in expandable section
+                    with st.expander(f"🔍 Technical Details - Test {i}", expanded=False):
                         col1, col2 = st.columns(2)
-                        
                         with col1:
-                            # Excel download
-                            excel_buffer = create_excel_download(results, stats, category_stats)
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            
-                            st.download_button(
-                                label="Download Detailed Report (Excel)",
-                                data=excel_buffer,
-                                file_name=f"api_test_results_{timestamp}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
-                            )
-                        
+                            st.markdown(f"**Method:** {test.get('method', 'GET')}")
+                            if test.get('payload') and test['payload'] != config['sample_payload']:
+                                st.markdown("**Custom Payload:**")
+                                st.code(json.dumps(test['payload'], indent=2), language='json')
                         with col2:
-                            # JSON download
-                            config = st.session_state.test_config
-                            json_data = {
-                                'summary': stats,
-                                'category_breakdown': category_stats,
-                                'detailed_results': results,
-                                'timestamp': timestamp,
-                                'endpoint': config['api_endpoint'],
-                                'method': config['http_method']
-                            }
-                            
-                            st.download_button(
-                                label="Download Results (JSON)",
-                                data=json.dumps(json_data, indent=2),
-                                file_name=f"api_test_results_{timestamp}.json",
-                                mime="application/json",
-                                use_container_width=True
-                            )
+                            if test.get('headers') and test['headers'] != config['custom_headers']:
+                                st.markdown("**Custom Headers:**")
+                                st.code(json.dumps(test['headers'], indent=2), language='json')
+        
+        # Test execution section
+        if st.session_state.test_cases:
+            st.header("⚡ Execute Security Tests")
+            
+            # Pre-execution summary
+            test_summary = {
+                'total': len(st.session_state.test_cases),
+                'critical': len([t for t in st.session_state.test_cases if t.get('risk_level') == 'CRITICAL']),
+                'high': len([t for t in st.session_state.test_cases if t.get('risk_level') == 'HIGH']),
+                'medium': len([t for t in st.session_state.test_cases if t.get('risk_level') == 'MEDIUM']),
+                'low': len([t for t in st.session_state.test_cases if t.get('risk_level') == 'LOW'])
+            }
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("Total Tests", test_summary['total'])
+            with col2:
+                st.metric("🔴 Critical", test_summary['critical'])
+            with col3:
+                st.metric("🟠 High", test_summary['high'])
+            with col4:
+                st.metric("🟡 Medium", test_summary['medium'])
+            with col5:
+                st.metric("🟢 Low", test_summary['low'])
+            
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                if st.button("🎯 Execute All Security Tests", type="primary", use_container_width=True):
+                    base_headers = {"Content-Type": "application/json", **config['custom_headers']}
+                    
+                    with st.spinner("🔍 Executing comprehensive security test suite..."):
+                        results, stats, attack_vector_stats, risk_level_stats = execute_tests(
+                            st.session_state.test_cases, 
+                            config['api_endpoint'], 
+                            base_headers
+                        )
+                        st.session_state.test_results = {
+                            'results': results,
+                            'stats': stats,
+                            'attack_vector_stats': attack_vector_stats,
+                            'risk_level_stats': risk_level_stats
+                        }
+            
+            # Display results
+            if st.session_state.test_results:
+                stats = st.session_state.test_results['stats']
+                attack_vector_stats = st.session_state.test_results['attack_vector_stats']
+                risk_level_stats = st.session_state.test_results['risk_level_stats']
+                results = st.session_state.test_results['results']
+                
+                st.header("📊 Security Test Results")
+                
+                # Overall metrics
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total Tests", stats['total'])
+                with col2:
+                    success_rate = (stats['passed']/stats['total']*100) if stats['total'] > 0 else 0
+                    st.metric("Passed", stats['passed'], delta=f"{success_rate:.1f}%")
+                with col3:
+                    failure_rate = (stats['failed']/stats['total']*100) if stats['total'] > 0 else 0
+                    st.metric("Failed", stats['failed'], delta=f"{failure_rate:.1f}%")
+                with col4:
+                    st.metric("Errors", stats['errors'])
+                
+                # Risk-based analysis
+                st.subheader("🚨 Risk-Based Analysis")
+                
+                high_risk_failures = [r for r in results if not r.get("status_matches", False) and r.get("risk_level", "").upper() in ["HIGH", "CRITICAL"]]
+                if high_risk_failures:
+                    st.error(f"🔴 **CRITICAL ALERT**: {len(high_risk_failures)} high-risk security tests failed!")
+                    
+                    # Show top high-risk failures
+                    with st.expander("🔍 High-Risk Failures Detail", expanded=True):
+                        for i, failure in enumerate(high_risk_failures[:10], 1):  # Show top 10
+                            st.markdown(f"**{i}. {failure['test_name']}** ({failure['risk_level']})")
+                            st.markdown(f"   - Attack Vector: {failure['attack_vector']}")
+                            st.markdown(f"   - Expected: {failure.get('expected_status', 'N/A')} | Got: {failure.get('actual_status', 'N/A')}")
+                            st.markdown(f"   - Description: {failure['description'][:100]}...")
+                else:
+                    st.success("✅ **Good News**: No high-risk security vulnerabilities detected!")
+                
+                # Attack vector breakdown
+                st.subheader("🎯 Results by Attack Vector")
+                
+                attack_data = []
+                for attack_vector, av_stats in attack_vector_stats.items():
+                    success_rate = (av_stats["passed"] / av_stats["total"] * 100) if av_stats["total"] > 0 else 0
+                    attack_data.append({
+                        "Attack Vector": attack_vector,
+                        "Total": av_stats["total"],
+                        "Passed": av_stats["passed"],
+                        "Failed": av_stats["failed"],
+                        "Success Rate": f"{success_rate:.1f}%"
+                    })
+                
+                attack_df = pd.DataFrame(attack_data)
+                st.dataframe(attack_df, use_container_width=True)
+                
+                # Risk level breakdown
+                st.subheader("⚠️ Results by Risk Level")
+                
+                risk_data = []
+                for risk_level, risk_stats in risk_level_stats.items():
+                    success_rate = (risk_stats["passed"] / risk_stats["total"] * 100) if risk_stats["total"] > 0 else 0
+                    risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🟠", "CRITICAL": "🔴"}.get(risk_level, "⚪")
+                    risk_data.append({
+                        "Risk Level": f"{risk_emoji} {risk_level}",
+                        "Total": risk_stats["total"],
+                        "Passed": risk_stats["passed"],
+                        "Failed": risk_stats["failed"],
+                        "Success Rate": f"{success_rate:.1f}%"
+                    })
+                
+                risk_df = pd.DataFrame(risk_data)
+                st.dataframe(risk_df, use_container_width=True)
+                
+                # Detailed results table
+                with st.expander("📋 All Test Results", expanded=False):
+                    display_columns = ['test_name', 'attack_vector', 'risk_level', 'expected_status', 'actual_status', 'test_result', 'description']
+                    results_df = pd.DataFrame(results)
+                    available_columns = [col for col in display_columns if col in results_df.columns]
+                    st.dataframe(results_df[available_columns], use_container_width=True)
+                
+                # Download section
+                st.subheader("💾 Download Comprehensive Security Report")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Excel download with enhanced sheets
+                    excel_buffer = create_excel_download(results, stats, attack_vector_stats, risk_level_stats)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    
+                    st.download_button(
+                        label="📊 Download Complete Security Report (Excel)",
+                        data=excel_buffer,
+                        file_name=f"context_aware_security_test_report_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    # JSON download with code analysis
+                    json_data = {
+                        'test_metadata': {
+                            'endpoint': config['api_endpoint'],
+                            'method': config['http_method'],
+                            'timestamp': timestamp,
+                            'test_type': 'context_aware_security_testing'
+                        },
+                        'code_analysis': code_analysis,
+                        'endpoint_details': config['endpoint_details'],
+                        'test_summary': stats,
+                        'attack_vector_breakdown': attack_vector_stats,
+                        'risk_level_breakdown': risk_level_stats,
+                        'detailed_results': results
+                    }
+                    
+                    st.download_button(
+                        label="📄 Download Results + Analysis (JSON)",
+                        data=json.dumps(json_data, indent=2),
+                        file_name=f"context_aware_security_analysis_{timestamp}.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
     
     else:
-        # Show instructions if no code is provided
+        # Show enhanced instructions
         st.info("""
-        **How to use:**
+        👆 **How to use the Context-Aware API Security Tester:**
         
-        1. **Paste your Flask API code** in the text area above
-        2. **Set your base URL** (e.g., http://localhost:5000)  
-        3. **Click 'Analyze Code'** to detect endpoints automatically
-        4. **Select an endpoint** to test from the dropdown
-        5. **Generate and execute** comprehensive security tests
-        6. **Download detailed results** in Excel format
+        **🔥 What Makes This Different:**
+        - **Analyzes YOUR actual code** - Not generic test templates
+        - **Understands your implementation** - Auth methods, business logic, validation patterns
+        - **Targets real vulnerabilities** - Tests based on detected security patterns
+        - **Comprehensive coverage** - Flow, boundary, injection, auth, business logic
         
-        The app will automatically detect:
-        - All Flask routes and HTTP methods
-        - Expected request payloads 
-        - Expected response status codes
-        - Security test scenarios
+        **📝 Step-by-Step Process:**
+        1. **📁 Provide Your API Code:**
+           - Paste complete API implementations with business logic
+           - Upload multiple files or ZIP archives
+           - Include authentication, validation, and database code
+        
+        2. **🔧 Add Real-World Context:**
+           - Actual cURL commands you use for testing
+           - Production/staging API URLs
+           - Authentication examples (tokens, headers)
+           - Expected behaviors and business rules
+        
+        3. **🧠 Intelligent Analysis:**
+           - Deep code analysis identifies security patterns
+           - Auto-detects endpoints, methods, and parameters
+           - Maps code patterns to attack vectors
+        
+        4. **🎯 Targeted Test Generation:**
+           - Context-aware tests target YOUR specific implementation
+           - Focus on detected vulnerabilities and patterns
+           - Comprehensive coverage of all security dimensions
+        
+        5. **⚡ Execute & Report:**
+           - Run tests against your live API
+           - Risk-based analysis and reporting
+           - Downloadable reports with code correlation
+        
+        **💡 Pro Tips for Maximum Effectiveness:**
+        - Include complete function implementations, not just route definitions
+        - Add authentication and authorization code for better security testing
+        - Provide real cURL commands with actual headers and payloads
+        - Test against staging environments first
         """)
     
-    # Sidebar with detected endpoints info
-    if st.session_state.parsed_endpoints:
-        with st.sidebar:
-            st.header("Detected Endpoints")
+    # Enhanced sidebar with intelligent analysis information
+    with st.sidebar:
+        st.header("🧠 Context-Aware Analysis")
+        
+        # Show analysis status
+        if st.session_state.code_analysis:
+            code_analysis = st.session_state.code_analysis
+            
+            st.subheader("🔍 Detected Patterns")
+            
+            analysis_categories = [
+                ("🔐 Authentication", code_analysis.get('authentication_methods', [])),
+                ("✅ Validation", code_analysis.get('validation_patterns', [])),
+                ("🛡️ Security Controls", code_analysis.get('security_controls', [])),
+                ("🧠 Business Logic", code_analysis.get('business_logic', [])),
+                ("💾 Database Ops", code_analysis.get('database_operations', [])),
+                ("📁 File Operations", code_analysis.get('file_operations', [])),
+                ("📥 Input Sources", code_analysis.get('input_sources', [])),
+                ("⚠️ Error Handling", code_analysis.get('error_handling', []))
+            ]
+            
+            for category_name, patterns in analysis_categories:
+                if patterns:
+                    with st.expander(f"{category_name} ({len(patterns)})", expanded=False):
+                        for pattern in patterns:
+                            st.write(f"• {pattern.replace('_', ' ').title()}")
+        
+        # Show endpoint analysis
+        if st.session_state.parsed_endpoints:
+            st.subheader("🎯 Detected Endpoints")
             for i, endpoint in enumerate(st.session_state.parsed_endpoints):
-                with st.expander(f"{endpoint['route']}", expanded=False):
+                with st.expander(f"📍 {endpoint['route']} ({endpoint.get('type', 'unknown').title()})", expanded=False):
                     st.write(f"**Methods:** {', '.join(endpoint['methods'])}")
                     st.write(f"**Function:** {endpoint['function_name']}")
-                    if endpoint['expected_fields']:
+                    
+                    if endpoint.get('full_url'):
+                        st.write(f"**Full URL:** {endpoint['full_url']}")
+                    
+                    if endpoint.get('expected_fields'):
                         st.write(f"**Expected Fields:** {', '.join(endpoint['expected_fields'])}")
+                    
+                    if endpoint.get('headers') and endpoint['headers']:
+                        st.write("**Context Headers:**")
+                        st.json(endpoint['headers'], expanded=False)
+                    
                     if endpoint['sample_payload']:
                         st.write("**Sample Payload:**")
                         st.json(endpoint['sample_payload'], expanded=False)
+        
+        # Show test generation progress
+        if st.session_state.test_cases:
+            st.subheader("🧪 Generated Test Analysis")
+            
+            # Test statistics
+            test_stats = {
+                'total': len(st.session_state.test_cases),
+                'attack_vectors': len(set(t.get('attack_vector', 'unknown') for t in st.session_state.test_cases)),
+                'risk_levels': {}
+            }
+            
+            for test in st.session_state.test_cases:
+                risk = test.get('risk_level', 'MEDIUM')
+                test_stats['risk_levels'][risk] = test_stats['risk_levels'].get(risk, 0) + 1
+            
+            st.metric("Total Tests", test_stats['total'])
+            st.metric("Attack Vectors", test_stats['attack_vectors'])
+            
+            st.write("**Risk Distribution:**")
+            for risk, count in sorted(test_stats['risk_levels'].items()):
+                emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🟠", "CRITICAL": "🔴"}.get(risk, "⚪")
+                st.write(f"{emoji} **{risk}:** {count}")
+        
+        # Show execution results
+        if st.session_state.test_results:
+            st.subheader("📊 Test Results Summary")
+            stats = st.session_state.test_results['stats']
+            
+            success_rate = (stats['passed'] / stats['total'] * 100) if stats['total'] > 0 else 0
+            
+            if success_rate >= 80:
+                st.success(f"✅ {success_rate:.1f}% Success Rate")
+            elif success_rate >= 60:
+                st.warning(f"⚠️ {success_rate:.1f}% Success Rate")
+            else:
+                st.error(f"❌ {success_rate:.1f}% Success Rate")
+            
+            st.write(f"**Passed:** {stats['passed']}")
+            st.write(f"**Failed:** {stats['failed']}")
+            st.write(f"**Errors:** {stats['errors']}")
+            
+            # High-risk failure alert
+            if 'results' in st.session_state.test_results:
+                high_risk_failures = [r for r in st.session_state.test_results['results'] 
+                                    if not r.get("status_matches", False) and 
+                                    r.get("risk_level", "").upper() in ["HIGH", "CRITICAL"]]
+                if high_risk_failures:
+                    st.error(f"🚨 {len(high_risk_failures)} High-Risk Failures!")
+                else:
+                    st.success("✅ No High-Risk Failures")
+            
+            # Quick actions
+            st.subheader("⚡ Quick Actions")
+            
+            if stats['failed'] > 0:
+                st.write("🔍 Review failed tests in main panel")
+            
+            if stats['errors'] > 0:
+                st.write("⚠️ Check error details in results")
+            
+            st.write("💾 Download comprehensive reports")
 
 if __name__ == "__main__":
     main()
