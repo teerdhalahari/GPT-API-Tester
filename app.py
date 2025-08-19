@@ -670,7 +670,7 @@ def generate_context_aware_test_cases(client, api_endpoint, http_method, sample_
         st.error("❌ OpenAI client is not initialized. Please check your API key.")
         return []
     
-    system_prompt = """You are an expert API security tester with deep knowledge of application security vulnerabilities and attack patterns. Your task is to generate highly targeted, context-aware security test cases based on ACTUAL CODE ANALYSIS and real-world attack scenarios.
+    system_prompt = """You are an expert API security tester with deep knowledge of application vulnerabilities and attack patterns. Your task is to generate highly targeted, context-aware test cases that includes flowlevel cases, edge cases, boundary cases etc.. based on ACTUAL CODE ANALYSIS and real-world attack scenarios.
 
 CRITICAL INSTRUCTIONS:
 1. ANALYZE THE PROVIDED CODE CONTEXT THOROUGHLY
@@ -2126,4 +2126,5 @@ https://api.myapp.com
 
 if __name__ == "__main__":
     main()
+
 
