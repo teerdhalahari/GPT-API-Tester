@@ -73,17 +73,40 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def initialize_openai_client(api_key):
-    """Initialize OpenAI client with provided API key"""
+    """Initialize OpenAI client with provided API key - IMPROVED VERSION"""
     try:
         if not api_key or not api_key.strip():
             return None, "No API key provided"
         
-        client = OpenAI(api_key=api_key.strip())
-        # Test the connection with a simple request
-        client.models.list()
-        return client, True
+        # Remove any whitespace and validate format
+        cleaned_key = api_key.strip()
+        
+        # Basic validation - OpenAI keys start with 'sk-'
+        if not cleaned_key.startswith('sk-'):
+            return None, "Invalid API key format. OpenAI keys should start with 'sk-'"
+        
+        # Initialize client
+        client = OpenAI(api_key=cleaned_key)
+        
+        # CRITICAL FIX: Test with a minimal request
+        try:
+            test_response = client.chat.completions.create(
+                model="gpt-3.5-turbo",  # Use cheaper model for testing
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=1,
+                temperature=0
+            )
+            return client, "success"
+        except Exception as test_error:
+            # If test fails, try with the original models.list() approach
+            try:
+                client.models.list()
+                return client, "success"
+            except Exception as models_error:
+                return None, f"API key validation failed: {str(test_error)}"
+        
     except Exception as e:
-        return None, str(e)
+        return None, f"Client initialization error: {str(e)}"
 
 def read_uploaded_files(uploaded_files):
     """Read content from uploaded files"""
@@ -640,7 +663,12 @@ def enhance_endpoints_with_context(endpoints, context_info):
     return enhanced_endpoints
 
 def generate_context_aware_test_cases(client, api_endpoint, http_method, sample_payload, custom_headers, code_analysis, endpoint_details):
-    """Generate test cases based on actual code analysis and context"""
+    """Generate test cases based on actual code analysis and context - FIXED VERSION"""
+    
+    # CRITICAL CHECK: Ensure client is valid
+    if not client:
+        st.error("❌ OpenAI client is not initialized. Please check your API key.")
+        return []
     
     system_prompt = """You are an expert API security tester with deep knowledge of application security vulnerabilities and attack patterns. Your task is to generate highly targeted, context-aware security test cases based on ACTUAL CODE ANALYSIS and real-world attack scenarios.
 
@@ -712,8 +740,9 @@ MISSION: Generate comprehensive, code-specific security test cases that:
 Generate as many test cases as needed for COMPLETE security coverage of this specific endpoint (typically 50-150+ tests for thorough analysis). Each test should be directly justified by the code analysis provided."""
 
     try:
+        # FIXED: Use proper model name and error handling
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-mini",  # Make sure model name is correct
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -722,16 +751,26 @@ Generate as many test cases as needed for COMPLETE security coverage of this spe
             max_tokens=8000
         )
         
+        if not response or not response.choices:
+            st.error("❌ No response received from OpenAI API")
+            return []
+        
         raw_response = response.choices[0].message.content.strip()
+        
+        if not raw_response:
+            st.error("❌ Empty response from OpenAI API")
+            return []
+        
         test_cases = parse_context_aware_tests(raw_response, sample_payload, custom_headers)
         return test_cases
         
     except Exception as e:
-        st.error(f"Failed to generate context-aware tests: {e}")
+        st.error(f"❌ Failed to generate context-aware tests: {e}")
+        st.error(f"Error details: {type(e).__name__}: {str(e)}")
         return []
 
 def parse_context_aware_tests(raw_text, sample_payload, custom_headers):
-    """Parse context-aware test cases from GPT response"""
+    """Parse context-aware test cases from GPT response with validation"""
     
     if not raw_text or raw_text.strip() == "":
         return []
@@ -762,25 +801,38 @@ def parse_context_aware_tests(raw_text, sample_payload, custom_headers):
             if match:
                 value = match.group(1).strip()
                 
-                if field == 'payload':
+                if field == 'method':
+                    # FIXED: Validate HTTP method
+                    valid_methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']
+                    method = value.upper()
+                    if method not in valid_methods:
+                        method = 'GET'  # Default to GET for invalid methods
+                    test_case['method'] = method
+                elif field == 'payload':
                     test_case['payload'] = parse_payload_value(value, sample_payload)
                 elif field == 'headers':
                     test_case['headers'] = parse_headers_value(value, custom_headers)
                 elif field == 'expected_status':
                     try:
-                        test_case['expected_status_code'] = int(re.findall(r'\d+', value)[0])
+                        # FIXED: Better status code parsing
+                        status_match = re.findall(r'\b(\d{3})\b', value)
+                        if status_match:
+                            test_case['expected_status_code'] = int(status_match[0])
+                        else:
+                            test_case['expected_status_code'] = 200
                     except:
                         test_case['expected_status_code'] = 200
                 else:
                     test_case[field] = value
         
-        # Only add if we got the essential fields
-        if all(key in test_case for key in ['name', 'method', 'expected_status_code']):
+        # FIXED: Validate essential fields before adding
+        required_fields = ['name', 'method', 'expected_status_code']
+        if all(key in test_case for key in required_fields):
             # Set defaults for missing fields
             if 'payload' not in test_case:
                 test_case['payload'] = sample_payload
             if 'headers' not in test_case:
-                test_case['headers'] = custom_headers
+                test_case['headers'] = custom_headers or {}
             if 'risk_level' not in test_case:
                 test_case['risk_level'] = 'MEDIUM'
             if 'description' not in test_case:
@@ -791,6 +843,10 @@ def parse_context_aware_tests(raw_text, sample_payload, custom_headers):
                 test_case['code_target'] = 'General endpoint testing'
                 
             test_cases.append(test_case)
+        else:
+            # Log missing fields for debugging
+            missing = [field for field in required_fields if field not in test_case]
+            print(f"Skipping test case due to missing fields: {missing}")
     
     return test_cases
 
@@ -870,7 +926,7 @@ def create_endpoint_selector(endpoints, base_url):
     return options
 
 def execute_tests(test_cases, api_endpoint, base_headers):
-    """Execute all test cases and return results"""
+    """Execute all test cases and return results - FIXED VERSION"""
     
     results = []
     stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0}
@@ -905,37 +961,77 @@ def execute_tests(test_cases, api_endpoint, base_headers):
             headers = {**base_headers, **(test_case.get("headers", {}) or {})}
             expected_status = test_case.get("expected_status_code", 200)
             
-            response = make_request(method, api_endpoint, payload, headers)
-            
-            status_matches = response.status_code == expected_status
-            
-            if status_matches:
-                stats["passed"] += 1
-                attack_vector_stats[attack_vector]["passed"] += 1
-                risk_level_stats[risk_level]["passed"] += 1
-            else:
-                stats["failed"] += 1
+            # FIXED: Add better error handling and logging
+            try:
+                response = make_request(method, api_endpoint, payload, headers)
+                
+                # FIXED: Check if response is valid
+                if response is None:
+                    raise Exception("No response received from server")
+                
+                status_matches = response.status_code == expected_status
+                
+                if status_matches:
+                    stats["passed"] += 1
+                    attack_vector_stats[attack_vector]["passed"] += 1
+                    risk_level_stats[risk_level]["passed"] += 1
+                    test_result = "PASS"
+                else:
+                    stats["failed"] += 1
+                    attack_vector_stats[attack_vector]["failed"] += 1
+                    risk_level_stats[risk_level]["failed"] += 1
+                    test_result = "FAIL"
+                
+                # FIXED: Better response body handling
+                try:
+                    response_body = response.text[:500] if response.text else "Empty response"
+                except:
+                    response_body = "Could not read response body"
+                
+                results.append({
+                    "test_name": test_case["name"],
+                    "attack_vector": attack_vector,
+                    "code_target": test_case.get("code_target", ""),
+                    "description": test_case.get("description", ""),
+                    "method": method,
+                    "payload": str(payload) if payload else "",
+                    "headers": str(test_case.get("headers", {})),
+                    "expected_status": expected_status,
+                    "actual_status": response.status_code,
+                    "response_body": response_body,
+                    "response_time": response.elapsed.total_seconds(),
+                    "status_matches": status_matches,
+                    "risk_level": risk_level,
+                    "test_result": test_result,
+                    "error": None  # No error in this case
+                })
+                
+            except requests.exceptions.RequestException as req_error:
+                # FIXED: Handle specific request errors
+                stats["errors"] += 1
                 attack_vector_stats[attack_vector]["failed"] += 1
                 risk_level_stats[risk_level]["failed"] += 1
-            
-            results.append({
-                "test_name": test_case["name"],
-                "attack_vector": attack_vector,
-                "code_target": test_case.get("code_target", ""),
-                "description": test_case.get("description", ""),
-                "method": method,
-                "payload": str(payload) if payload else "",
-                "headers": str(test_case.get("headers", {})),
-                "expected_status": expected_status,
-                "actual_status": response.status_code,
-                "response_body": response.text[:500],
-                "response_time": response.elapsed.total_seconds(),
-                "status_matches": status_matches,
-                "risk_level": risk_level,
-                "test_result": "PASS" if status_matches else "FAIL"
-            })
+                
+                results.append({
+                    "test_name": test_case["name"],
+                    "attack_vector": attack_vector,
+                    "code_target": test_case.get("code_target", ""),
+                    "description": test_case.get("description", ""),
+                    "method": method,
+                    "payload": str(payload) if payload else "",
+                    "headers": str(test_case.get("headers", {})),
+                    "expected_status": expected_status,
+                    "actual_status": "Request Error",
+                    "response_body": "",
+                    "response_time": 0,
+                    "status_matches": False,
+                    "risk_level": risk_level,
+                    "test_result": "ERROR",
+                    "error": f"Request Error: {str(req_error)}"
+                })
             
         except Exception as e:
+            # FIXED: Better general error handling
             stats["errors"] += 1
             attack_vector_stats[attack_vector]["failed"] += 1
             risk_level_stats[risk_level]["failed"] += 1
@@ -945,33 +1041,84 @@ def execute_tests(test_cases, api_endpoint, base_headers):
                 "attack_vector": attack_vector,
                 "code_target": test_case.get("code_target", ""),
                 "description": test_case.get("description", ""),
-                "error": str(e),
+                "method": method if 'method' in locals() else "UNKNOWN",
+                "payload": str(payload) if 'payload' in locals() and payload else "",
+                "headers": str(test_case.get("headers", {})),
+                "expected_status": expected_status if 'expected_status' in locals() else "UNKNOWN",
+                "actual_status": "Exception",
+                "response_body": "",
+                "response_time": 0,
                 "status_matches": False,
                 "risk_level": risk_level,
-                "test_result": "ERROR"
+                "test_result": "ERROR",
+                "error": f"Test Execution Error: {str(e)}"
             })
+            
+            # FIXED: Log the error for debugging
+            print(f"Error in test '{test_case['name']}': {str(e)}")
     
     status_text.text("✅ Test execution completed!")
     return results, stats, attack_vector_stats, risk_level_stats
 
 def make_request(method, url, payload=None, headers=None):
-    """Make HTTP request"""
+    """Make HTTP request with improved error handling"""
+    
+    # Validate URL
+    if not url or not url.strip():
+        raise ValueError("URL cannot be empty")
+    
+    # Ensure URL has proper protocol
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    # Default headers
+    default_headers = {"Content-Type": "application/json"}
+    if headers:
+        default_headers.update(headers)
     
     request_kwargs = {
         "url": url,
-        "headers": headers or {"Content-Type": "application/json"},
-        "timeout": 10
+        "headers": default_headers,
+        "timeout": 30,  # Increased timeout
+        "verify": True,  # SSL verification
+        "allow_redirects": True
     }
     
-    if method.upper() in ["POST", "PUT", "PATCH"] and payload is not None:
+    # Handle different methods and payloads
+    method_upper = method.upper()
+    
+    if method_upper in ["POST", "PUT", "PATCH"] and payload is not None:
         if isinstance(payload, dict):
             request_kwargs["json"] = payload
+        elif isinstance(payload, str):
+            try:
+                # Try to parse as JSON first
+                parsed_payload = json.loads(payload)
+                request_kwargs["json"] = parsed_payload
+            except json.JSONDecodeError:
+                # If not JSON, send as data
+                request_kwargs["data"] = payload
+                request_kwargs["headers"]["Content-Type"] = "text/plain"
         else:
             request_kwargs["data"] = str(payload)
-    elif method.upper() == "GET" and payload:
-        request_kwargs["params"] = payload if isinstance(payload, dict) else {"q": str(payload)}
+    elif method_upper == "GET" and payload:
+        if isinstance(payload, dict):
+            request_kwargs["params"] = payload
+        else:
+            request_kwargs["params"] = {"q": str(payload)}
     
-    return requests.request(method, **request_kwargs)
+    # Make the request
+    try:
+        response = requests.request(method_upper, **request_kwargs)
+        return response
+    except requests.exceptions.Timeout:
+        raise requests.exceptions.RequestException("Request timed out")
+    except requests.exceptions.ConnectionError:
+        raise requests.exceptions.RequestException("Connection error - check URL and network")
+    except requests.exceptions.HTTPError as e:
+        raise requests.exceptions.RequestException(f"HTTP error: {e}")
+    except Exception as e:
+        raise requests.exceptions.RequestException(f"Unexpected error: {e}")
 
 def create_excel_download(results, stats, attack_vector_stats, risk_level_stats):
     """Create Excel file with detailed results"""
@@ -1043,21 +1190,38 @@ def create_excel_download(results, stats, attack_vector_stats, risk_level_stats)
 def main():
     st.markdown('<div class="main-header">🔒 Context-Aware API Security Tester</div>', unsafe_allow_html=True)
     
-    # Get API key from user
-    user_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+    # FIXED: Better API key handling and validation
+    user_api_key = st.text_input("Enter your OpenAI API key:", type="password", help="Your OpenAI API key (starts with sk-)")
     
     if not user_api_key:
         st.warning("Please enter your OpenAI API key to continue.")
+        st.info("""
+        **Need an OpenAI API key?**
+        1. Go to [OpenAI Platform](https://platform.openai.com/api-keys)
+        2. Sign in or create an account
+        3. Create a new API key
+        4. Copy and paste it here
+        
+        **Note:** Make sure your API key has sufficient credits and access to GPT models.
+        """)
         return
     
-    # Initialize client with the provided key
-    client, error = initialize_openai_client(user_api_key)
+    # FIXED: Better client initialization with detailed error messages
+    with st.spinner("🔄 Validating OpenAI API key..."):
+        client, result = initialize_openai_client(user_api_key)
+        
     if not client:
-        st.error(f"OpenAI API connection failed: {error}")
-        st.info("Please make sure your API key is valid and has sufficient credits.")
+        st.error(f"❌ OpenAI API connection failed: {result}")
+        if "Invalid API key format" in str(result):
+            st.info("💡 Make sure your API key starts with 'sk-' and is copied correctly.")
+        elif "validation failed" in str(result):
+            st.info("💡 Possible issues:\n- API key might be invalid or expired\n- Insufficient credits in your OpenAI account\n- Network connectivity issues")
+        elif "quota" in str(result).lower():
+            st.error("💳 Your OpenAI account has exceeded the API quota. Please check your billing settings.")
+        
         return
     
-    st.success("OpenAI API connected successfully!")
+    st.success("✅ OpenAI API connected successfully!")
     
     # Initialize session state
     if 'parsed_endpoints' not in st.session_state:
@@ -1962,3 +2126,4 @@ https://api.myapp.com
 
 if __name__ == "__main__":
     main()
+
